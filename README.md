@@ -117,5 +117,7 @@ staying inside app sandbox rules and without touching the single system
 
 ## License
 
-MIT, matching the vendored hev-task-system.
-```
+MIT — see [LICENSE](LICENSE).
+
+The vendored runtime under `third-part/hev-task-system` is also MIT
+(see `third-part/hev-task-system/LICENSE`).
