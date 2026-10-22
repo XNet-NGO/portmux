@@ -80,7 +80,29 @@ portmux_egress_apply (int fd, int family, const PortmuxEgress *egress)
             return 0;
         return egress->callback (fd, egress->callback_data);
 
+    case PORTMUX_EGRESS_PROVIDED_FD:
+        /* The fd was supplied already-configured by the provider; portmux
+           must not re-apply any egress sockopt. Adoption happens at socket
+           creation time (see portmux_egress_provide_fd). */
+        return 0;
+
     default:
         return 0;
     }
+}
+
+int
+portmux_egress_provide_fd (int family, int socktype,
+                           const PortmuxEgress *egress)
+{
+    (void)family; (void)socktype;
+    if (!egress || egress->kind != PORTMUX_EGRESS_PROVIDED_FD
+        || !egress->provider) {
+        PM_LOG_W ("egress: PROVIDED_FD without a provider");
+        return -1;
+    }
+    int fd = egress->provider (family, socktype, egress->callback_data);
+    if (fd < 0)
+        PM_LOG_W ("egress: provider returned no fd (%d)", fd);
+    return fd;
 }

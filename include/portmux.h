@@ -48,6 +48,12 @@ typedef enum
     PORTMUX_EGRESS_DEVICE,
     PORTMUX_EGRESS_SOURCE,
     PORTMUX_EGRESS_CALLBACK,
+    /* PROVIDED_FD: the upstream socket is supplied by a provider callback
+       (e.g. a privileged helper daemon that created an interface-pinned or
+       low-port-bound socket under CAP_NET_RAW/CAP_NET_BIND_SERVICE and passed
+       the fd back via SCM_RIGHTS). portmux adopts the fd AS-IS instead of
+       calling socket(); no egress sockopt is applied by portmux. */
+    PORTMUX_EGRESS_PROVIDED_FD,
 } PortmuxEgressKind;
 
 /**
@@ -62,6 +68,19 @@ typedef enum
 typedef int (*PortmuxFdHook) (int fd, void *user_data);
 
 /**
+ * PortmuxFdProvider:
+ * @family: AF_INET or AF_INET6 that the route resolved to.
+ * @socktype: SOCK_STREAM or SOCK_DGRAM.
+ * @user_data: opaque pointer from PortmuxEgress.callback_data.
+ *
+ * For PORTMUX_EGRESS_PROVIDED_FD. Must return a ready-to-use, NOT-yet-connected
+ * socket fd of the given family/type (ownership transfers to portmux, which
+ * will connect() and close() it), or < 0 on failure. Used to adopt a socket
+ * minted by a privileged helper (interface-pinned / low-port-bound).
+ */
+typedef int (*PortmuxFdProvider) (int family, int socktype, void *user_data);
+
+/**
  * PortmuxEgress:
  * Egress policy applied to every upstream socket a route creates.
  */
@@ -71,7 +90,8 @@ typedef struct
     const char *device;     /* DEVICE: interface name, e.g. "wlan0"          */
     const char *source_ip;  /* SOURCE: local source IP to bind, e.g. "10.0.0.2" */
     PortmuxFdHook callback; /* CALLBACK: fd hook                              */
-    void *callback_data;    /* CALLBACK: opaque data for the hook            */
+    PortmuxFdProvider provider; /* PROVIDED_FD: supplies the upstream fd      */
+    void *callback_data;    /* CALLBACK/PROVIDED_FD: opaque data             */
 } PortmuxEgress;
 
 typedef struct _Portmux Portmux;

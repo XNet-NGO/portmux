@@ -20,4 +20,15 @@
  */
 int portmux_egress_apply (int fd, int family, const PortmuxEgress *egress);
 
+/**
+ * portmux_egress_provide_fd:
+ * @family: AF_INET/AF_INET6
+ * @socktype: SOCK_STREAM/SOCK_DGRAM
+ * @egress: must be PORTMUX_EGRESS_PROVIDED_FD with a provider set
+ *
+ * Returns a provider-supplied fd (>=0, ownership to caller) or < 0.
+ */
+int portmux_egress_provide_fd (int family, int socktype,
+                               const PortmuxEgress *egress);
+
 #endif /* __PORTMUX_EGRESS_H__ */

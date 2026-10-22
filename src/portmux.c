@@ -164,16 +164,23 @@ tcp_conn_task (void *data)
     if (family < 0)
         goto close_client;
 
-    up_fd = hev_task_io_socket_socket (family, SOCK_STREAM, 0);
-    if (up_fd < 0) {
-        PM_LOG_W ("tcp: upstream socket: %s", strerror (errno));
-        goto close_client;
-    }
-
-    if (portmux_egress_apply (up_fd, family,
-                              r->egress_valid ? &r->egress : NULL) < 0) {
-        close (up_fd);
-        goto close_client;
+    if (r->egress_valid && r->egress.kind == PORTMUX_EGRESS_PROVIDED_FD) {
+        up_fd = portmux_egress_provide_fd (family, SOCK_STREAM, &r->egress);
+        if (up_fd < 0) {
+            PM_LOG_W ("tcp: provided-fd egress failed");
+            goto close_client;
+        }
+    } else {
+        up_fd = hev_task_io_socket_socket (family, SOCK_STREAM, 0);
+        if (up_fd < 0) {
+            PM_LOG_W ("tcp: upstream socket: %s", strerror (errno));
+            goto close_client;
+        }
+        if (portmux_egress_apply (up_fd, family,
+                                  r->egress_valid ? &r->egress : NULL) < 0) {
+            close (up_fd);
+            goto close_client;
+        }
     }
 
     hev_task_add_fd (hev_task_self (), up_fd, POLLIN | POLLOUT);
@@ -403,14 +410,19 @@ udp_new_flow (PmUdpState *st, const struct sockaddr_storage *peer,
     if (family < 0)
         return NULL;
 
-    up_fd = hev_task_io_socket_socket (family, SOCK_DGRAM, 0);
-    if (up_fd < 0)
-        return NULL;
-
-    if (portmux_egress_apply (up_fd, family,
-                              r->egress_valid ? &r->egress : NULL) < 0) {
-        close (up_fd);
-        return NULL;
+    if (r->egress_valid && r->egress.kind == PORTMUX_EGRESS_PROVIDED_FD) {
+        up_fd = portmux_egress_provide_fd (family, SOCK_DGRAM, &r->egress);
+        if (up_fd < 0)
+            return NULL;
+    } else {
+        up_fd = hev_task_io_socket_socket (family, SOCK_DGRAM, 0);
+        if (up_fd < 0)
+            return NULL;
+        if (portmux_egress_apply (up_fd, family,
+                                  r->egress_valid ? &r->egress : NULL) < 0) {
+            close (up_fd);
+            return NULL;
+        }
     }
 
     /* connect() the UDP socket so recv() only yields target replies. */
