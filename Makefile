@@ -11,8 +11,12 @@ BINDIR   = bin
 TPDIR    = third-part
 HTS      = $(TPDIR)/hev-task-system
 
-CFLAGS  += -O3 -pipe -Wall -Wextra -std=gnu11 \
-           -I$(INCDIR) -I$(SRCDIR) -I$(HTS)/include
+# Internal flags are kept separate from the user-facing CFLAGS so that a
+# command-line `make CFLAGS=...` augments rather than clobbers our includes.
+# Pass extra flags via CFLAGS or EXTRA_CFLAGS (e.g. CFLAGS=-fPIC).
+PM_CFLAGS = -O3 -pipe -Wall -Wextra -std=gnu11 \
+            -I$(INCDIR) -I$(SRCDIR) -I$(HTS)/include \
+            $(CFLAGS) $(EXTRA_CFLAGS)
 LDFLAGS += -L$(HTS)/bin -lhev-task-system -lpthread
 
 LIB_SRCS = $(SRCDIR)/portmux.c \
@@ -40,7 +44,7 @@ hts: $(HTS_LIB)
 
 $(BUILDDIR)/%.o: $(SRCDIR)/%.c | $(BUILDDIR)
 	@echo "CC    $<"
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(PM_CFLAGS) -c $< -o $@
 
 $(STATIC): $(LIB_OBJS)
 	@mkdir -p $(BINDIR)
@@ -49,7 +53,7 @@ $(STATIC): $(LIB_OBJS)
 
 $(CLI): $(HTS_LIB) $(LIB_OBJS) $(CLI_OBJ) | $(BINDIR)
 	@echo "LINK  $@"
-	$(CC) $(CFLAGS) $(LIB_OBJS) $(CLI_OBJ) -o $@ $(LDFLAGS)
+	$(CC) $(PM_CFLAGS) $(LIB_OBJS) $(CLI_OBJ) -o $@ $(LDFLAGS)
 
 $(BUILDDIR):
 	@mkdir -p $(BUILDDIR)
@@ -59,11 +63,11 @@ $(BINDIR):
 
 test: $(STATIC) $(HTS_LIB)
 	@echo "CC    tests/test_relay"
-	$(CC) $(CFLAGS) tests/test_relay.c $(STATIC) -o $(BUILDDIR)/test_relay $(LDFLAGS)
+	$(CC) $(PM_CFLAGS) tests/test_relay.c $(STATIC) -o $(BUILDDIR)/test_relay $(LDFLAGS)
 	@echo "RUN   test_relay"
 	@$(BUILDDIR)/test_relay
 	@echo "CC    tests/test_udp_evict (short timeouts)"
-	$(CC) $(CFLAGS) -DPM_UDP_IDLE_MS=800 -DPM_UDP_SWEEP_MS=200 \
+	$(CC) $(PM_CFLAGS) -DPM_UDP_IDLE_MS=800 -DPM_UDP_SWEEP_MS=200 \
 		$(LIB_SRCS) tests/test_udp_evict.c -o $(BUILDDIR)/test_udp_evict $(LDFLAGS)
 	@echo "RUN   test_udp_evict"
 	@$(BUILDDIR)/test_udp_evict

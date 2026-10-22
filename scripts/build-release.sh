@@ -61,12 +61,14 @@ build_android () {
   fi
   echo "=== Android $abi ($triple, API $API) ==="
   make clean >/dev/null 2>&1 || true
-  # Build hev-task-system static for this ABI
+  # Build hev-task-system static for this ABI.
+  # -fPIC is required: these .a files get linked into a consumer .so
+  # (e.g. an Android JNI library), which must be fully position-independent.
   make -C third-part/hev-task-system clean >/dev/null 2>&1 || true
   make -C third-part/hev-task-system static \
-      CC="$cc" AR="$LLVM_AR" CROSS_PREFIX= >/dev/null
+      CC="$cc" AR="$LLVM_AR" CROSS_PREFIX= CFLAGS="-fPIC" >/dev/null
   # Build portmux static lib for this ABI (library only, not CLI)
-  make bin/libportmux.a CC="$cc" AR="$LLVM_AR" CROSS_PREFIX= >/dev/null
+  make bin/libportmux.a CC="$cc" AR="$LLVM_AR" CROSS_PREFIX= CFLAGS="-fPIC" >/dev/null
   mkdir -p "$DIST/android/$abi"
   cp bin/libportmux.a "$DIST/android/$abi/"
   cp third-part/hev-task-system/bin/libhev-task-system.a "$DIST/android/$abi/"
