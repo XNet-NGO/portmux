@@ -1,6 +1,9 @@
 # Build outputs
 /build/
 /bin/
+/dist/
+/.buildtmp/
+*-artifacts.tar.gz
 
 # Editor / OS
 *.o

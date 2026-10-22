@@ -32,6 +32,30 @@ The hev-task-system runtime is vendored under `third-part/hev-task-system`
 (MIT, pinned at upstream commit `935f3c1`), so a plain `git clone` is enough —
 no submodule init required.
 
+## Prebuilt artifacts
+
+Each tagged release publishes prebuilt static libraries so an Android NDK (or
+host) project can consume portmux without building it. Download the release
+tarball or the per-ABI `.a` files from the
+[Releases](https://github.com/XNet-NGO/portmux/releases) page.
+
+Android (link **both** archives into your NDK target):
+
+```
+android/<abi>/libportmux.a
+android/<abi>/libhev-task-system.a   # transitive dependency
+```
+
+ABIs: `arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86` (built against NDK r28, API 21).
+The public header is `include/portmux.h`. A host `linux-x86_64` build (static
+lib + CLI) is included too.
+
+Regenerate locally with:
+
+```sh
+ANDROID_NDK_HOME=/path/to/ndk ./scripts/build-release.sh   # -> dist/ + tarball
+```
+
 ## CLI
 
 ```
