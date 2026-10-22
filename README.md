@@ -24,10 +24,13 @@ for no benefit. portmux keeps the valuable parts of that lineage — the
 ## Build
 
 ```sh
-git submodule update --init --recursive   # vendors hev-task-system
 make            # builds bin/portmux (CLI) and bin/libportmux.a (static lib)
-make test       # runs the in-process TCP+UDP end-to-end test
+make test       # runs the in-process TCP+UDP end-to-end + idle-eviction tests
 ```
+
+The hev-task-system runtime is vendored under `third-part/hev-task-system`
+(MIT, pinned at upstream commit `935f3c1`), so a plain `git clone` is enough —
+no submodule init required.
 
 ## CLI
 
