@@ -4,7 +4,9 @@ Userspace TCP/UDP port forwarder for same-device loopback and cross-interface
 relays. No TUN device, no VPN permission, no root required for the loopback and
 source-bind cases. Built on the [hev-task-system](https://github.com/heiher/hev-task-system)
 coroutine runtime — the same scheduler used by hev-socks5-tunnel — but with **no
-lwIP and no SOCKS5**: it moves bytes between real kernel sockets.
+lwIP**: it moves bytes between real kernel sockets. It also includes an optional
+**SOCKS5 proxy** inbound (CONNECT + UDP ASSOCIATE) that reuses the same
+socket-level relay and egress machinery — still no lwIP and no TUN.
 
 ## Why not lwIP?
 
@@ -13,6 +15,9 @@ what hev-socks5-tunnel needs). A port forwarder already has layer-4 sockets on
 both ends, so a second userspace TCP/IP stack would add latency and failure modes
 for no benefit. portmux keeps the valuable parts of that lineage — the
 `hev-task` coroutine model and the backpressure-aware splice — and drops lwIP.
+The SOCKS5 inbound follows the same principle: it terminates the client on a
+real kernel socket and splices to a real upstream socket, so it needs no
+userspace IP stack.
 
 ## Use cases
 
@@ -62,6 +67,7 @@ ANDROID_NDK_HOME=/path/to/ndk ./scripts/build-release.sh   # -> dist/ + tarball
 portmux [-v] ROUTE [ROUTE ...]
 
 ROUTE: PROTO:LADDR:LPORT:TADDR:TPORT[:EGRESS]
+       socks:LADDR:LPORT[:EGRESS]     (SOCKS5 proxy, dynamic per-connection target)
   PROTO  tcp | udp
   EGRESS dev=IFNAME   (SO_BINDTODEVICE; needs CAP_NET_RAW/root)
          src=IP       (bind upstream socket to a local source IP)
@@ -75,7 +81,30 @@ portmux tcp:127.0.0.1:39811:127.0.0.1:2222
 
 # DAW -> VST, udp, pin egress to wlan0
 portmux udp:127.0.0.1:9000:127.0.0.1:9001:dev=wlan0
+
+# SOCKS5 proxy on :1080, every upstream connection pinned to wlan0
+portmux socks:127.0.0.1:1080:dev=wlan0
 ```
+
+## SOCKS5 proxy
+
+`portmux_add_socks()` (CLI `socks:...`) opens a **SOCKS5 proxy** listener
+instead of a fixed `A -> B` forward. The destination is chosen **per
+connection** by the SOCKS client, not baked into the route.
+
+- **Auth:** no-auth only (method `0x00`), per RFC 1928.
+- **Commands:** `CONNECT` (TCP, spliced like a normal route) and
+  `UDP ASSOCIATE` (a UDP relay socket is bound and datagrams are relayed to
+  per-destination, egress-pinned upstream sockets). `BIND` is unsupported.
+- **Address types:** IPv4, IPv6, and domain names.
+- **Egress:** the route's `PortmuxEgress` is applied to **every** upstream
+  socket the proxy opens, so egress pinning is per client connection. On
+  Android the no-root path is `PORTMUX_EGRESS_CALLBACK` →
+  `android_setsocknetwork()`, giving a **SOCKS proxy whose upstream is pinned to
+  a chosen network (e.g. cellular) with no root and no TUN**.
+
+A SOCKS5 proxy dials arbitrary destinations by design; expose it deliberately
+(loopback bind, and in higher layers behind an explicit allow flag).
 
 ## Library API
 

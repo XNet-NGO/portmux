@@ -27,59 +27,13 @@
 #include "portmux-log.h"
 #include "portmux-addr.h"
 #include "portmux-egress.h"
+#include "portmux-internal.h"
 
 int portmux_log_level = 3;
 
-#define PM_MAX_ROUTES 64
-#define PM_TCP_SPLICE_BUF (256 * 1024)
-#define PM_UDP_DGRAM_MAX 65536
-#ifndef PM_UDP_IDLE_MS
-#define PM_UDP_IDLE_MS 60000
-#endif
-#ifndef PM_UDP_SWEEP_MS
-#define PM_UDP_SWEEP_MS 5000
-#endif
-#define PM_UDP_MAX_FLOWS 1024
-
-struct _PortmuxRoute
-{
-    PortmuxProto proto;
-    char listen_addr[128];
-    int listen_port;
-    char target_addr[128];
-    int target_port;
-    PortmuxEgress egress;
-    int egress_valid;
-
-    Portmux *owner;
-    int listen_fd;
-};
-
-/* Registry node: every long-running task links itself here so shutdown can
-   wake tasks parked in WAITIO (setting run=0 alone does not wake them). */
-typedef struct PmTaskNode PmTaskNode;
-struct PmTaskNode
-{
-    PmTaskNode *next;
-    PmTaskNode *prev;
-    HevTask *task;
-};
-
-struct _Portmux
-{
-    PortmuxRoute routes[PM_MAX_ROUTES];
-    int route_count;
-
-    volatile int run;
-    int opened;
-    int event_fds[2]; /* [0] read in event task, [1] written by stop() */
-
-    PmTaskNode *tasks; /* head of live-task registry (single-thread access) */
-};
-
 /* ─────────────────── task registry (cooperative) ───────────── */
 
-static void
+void
 pm_task_register (Portmux *self, PmTaskNode *node)
 {
     node->task = hev_task_self ();
@@ -90,7 +44,7 @@ pm_task_register (Portmux *self, PmTaskNode *node)
     self->tasks = node;
 }
 
-static void
+void
 pm_task_unregister (Portmux *self, PmTaskNode *node)
 {
     if (node->prev)
@@ -112,8 +66,8 @@ pm_wake_all_tasks (Portmux *self)
 
 /* ───────────────────────── yielders ───────────────────────── */
 
-static int
-run_yielder (HevTaskYieldType type, void *data)
+int
+pm_run_yielder (HevTaskYieldType type, void *data)
 {
     Portmux *self = data;
     hev_task_yield (type);
@@ -121,8 +75,8 @@ run_yielder (HevTaskYieldType type, void *data)
 }
 
 /* Monotonic milliseconds for idle-flow accounting. */
-static unsigned long
-mono_ms (void)
+unsigned long
+pm_mono_ms (void)
 {
     struct timespec ts;
     clock_gettime (CLOCK_MONOTONIC, &ts);
@@ -131,11 +85,39 @@ mono_ms (void)
 
 /* Disable Nagle so small request/response messages are not delayed. Critical
    for latency-sensitive relays (MCP control, DAW<->VST messaging). */
-static void
-set_nodelay (int fd)
+void
+pm_set_nodelay (int fd)
 {
     int on = 1;
     setsockopt (fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof (on));
+}
+
+/* Create an upstream socket honoring the route's egress policy. Shared by the
+   plain TCP/UDP relays and the SOCKS5 proxy so egress pinning behaves
+   identically everywhere. Returns a fd (NOT yet connected) or < 0. */
+int
+pm_make_upstream_fd (PortmuxRoute *r, int family, int socktype)
+{
+    int up_fd;
+
+    if (r->egress_valid && r->egress.kind == PORTMUX_EGRESS_PROVIDED_FD) {
+        up_fd = portmux_egress_provide_fd (family, socktype, &r->egress);
+        if (up_fd < 0)
+            return -1;
+        return up_fd;
+    }
+
+    up_fd = hev_task_io_socket_socket (family, socktype, 0);
+    if (up_fd < 0) {
+        PM_LOG_W ("upstream socket: %s", strerror (errno));
+        return -1;
+    }
+    if (portmux_egress_apply (up_fd, family,
+                              r->egress_valid ? &r->egress : NULL) < 0) {
+        close (up_fd);
+        return -1;
+    }
+    return up_fd;
 }
 
 /* ─────────────────────── TCP forwarding ────────────────────── */
@@ -165,20 +147,15 @@ tcp_conn_task (void *data)
         goto close_client;
 
     if (r->egress_valid && r->egress.kind == PORTMUX_EGRESS_PROVIDED_FD) {
-        up_fd = portmux_egress_provide_fd (family, SOCK_STREAM, &r->egress);
+        up_fd = pm_make_upstream_fd (r, family, SOCK_STREAM);
         if (up_fd < 0) {
             PM_LOG_W ("tcp: provided-fd egress failed");
             goto close_client;
         }
     } else {
-        up_fd = hev_task_io_socket_socket (family, SOCK_STREAM, 0);
+        up_fd = pm_make_upstream_fd (r, family, SOCK_STREAM);
         if (up_fd < 0) {
-            PM_LOG_W ("tcp: upstream socket: %s", strerror (errno));
-            goto close_client;
-        }
-        if (portmux_egress_apply (up_fd, family,
-                                  r->egress_valid ? &r->egress : NULL) < 0) {
-            close (up_fd);
+            PM_LOG_W ("tcp: upstream socket/egress failed");
             goto close_client;
         }
     }
@@ -186,7 +163,7 @@ tcp_conn_task (void *data)
     hev_task_add_fd (hev_task_self (), up_fd, POLLIN | POLLOUT);
 
     res = hev_task_io_socket_connect (up_fd, (struct sockaddr *)&ss, sslen,
-                                      run_yielder, c->owner);
+                                      pm_run_yielder, c->owner);
     if (res < 0) {
         PM_LOG_I ("tcp: connect %s:%d failed", r->target_addr, r->target_port);
         hev_task_del_fd (hev_task_self (), up_fd);
@@ -197,15 +174,15 @@ tcp_conn_task (void *data)
     PM_LOG_D ("tcp: %d <-> %s:%d established", c->client_fd, r->target_addr,
               r->target_port);
 
-    set_nodelay (up_fd);
-    set_nodelay (c->client_fd);
+    pm_set_nodelay (up_fd);
+    pm_set_nodelay (c->client_fd);
 
     /* Both fds must be in the task reactor for the splice to wake on I/O. */
     hev_task_add_fd (hev_task_self (), c->client_fd, POLLIN | POLLOUT);
 
     /* Bidirectional splice with backpressure (vendored, lwIP-free). */
     hev_task_io_splice (c->client_fd, c->client_fd, up_fd, up_fd,
-                        PM_TCP_SPLICE_BUF, run_yielder, c->owner);
+                        PM_TCP_SPLICE_BUF, pm_run_yielder, c->owner);
 
     hev_task_del_fd (hev_task_self (), up_fd);
     close (up_fd);
@@ -236,7 +213,7 @@ tcp_listen_task (void *data)
         int cfd;
 
         cfd = hev_task_io_socket_accept (r->listen_fd, (struct sockaddr *)&peer,
-                                         &plen, run_yielder, self);
+                                         &plen, pm_run_yielder, self);
         if (cfd == -2) /* yielder signalled shutdown */
             break;
         if (cfd < 0)
@@ -349,7 +326,7 @@ udp_flow_task (void *data)
         /* upstream -> client via the shared listener socket */
         sendto (f->listen_fd, buf, n, 0, (struct sockaddr *)&f->peer,
                 f->peer_len);
-        f->last_ms = mono_ms ();
+        f->last_ms = pm_mono_ms ();
     }
 
     free (buf);
@@ -410,20 +387,9 @@ udp_new_flow (PmUdpState *st, const struct sockaddr_storage *peer,
     if (family < 0)
         return NULL;
 
-    if (r->egress_valid && r->egress.kind == PORTMUX_EGRESS_PROVIDED_FD) {
-        up_fd = portmux_egress_provide_fd (family, SOCK_DGRAM, &r->egress);
-        if (up_fd < 0)
-            return NULL;
-    } else {
-        up_fd = hev_task_io_socket_socket (family, SOCK_DGRAM, 0);
-        if (up_fd < 0)
-            return NULL;
-        if (portmux_egress_apply (up_fd, family,
-                                  r->egress_valid ? &r->egress : NULL) < 0) {
-            close (up_fd);
-            return NULL;
-        }
-    }
+    up_fd = pm_make_upstream_fd (r, family, SOCK_DGRAM);
+    if (up_fd < 0)
+        return NULL;
 
     /* connect() the UDP socket so recv() only yields target replies. */
     if (connect (up_fd, (struct sockaddr *)&tss, tlen) < 0) {
@@ -443,7 +409,7 @@ udp_new_flow (PmUdpState *st, const struct sockaddr_storage *peer,
     f->up_fd = up_fd;
     f->listen_fd = r->listen_fd;
     f->owner = st->owner;
-    f->last_ms = mono_ms ();
+    f->last_ms = pm_mono_ms ();
     f->evict = 0;
     f->done = 0;
 
@@ -491,7 +457,7 @@ udp_sweeper_task (void *data)
         if (!st->owner->run || !st->sweeper_run)
             break;
 
-        now = mono_ms ();
+        now = pm_mono_ms ();
         for (f = st->flows; f; f = f->next) {
             if (f->done || f->evict)
                 continue;
@@ -548,7 +514,7 @@ udp_listen_task (void *data)
 
         n = hev_task_io_socket_recvfrom (r->listen_fd, buf, PM_UDP_DGRAM_MAX, 0,
                                          (struct sockaddr *)&peer, &plen,
-                                         run_yielder, self);
+                                         pm_run_yielder, self);
         if (n == -2)
             break;
         if (n <= 0)
@@ -566,7 +532,7 @@ udp_listen_task (void *data)
         /* client -> upstream (socket is connected to target) */
         if (f->up_fd >= 0) {
             (void)send (f->up_fd, buf, n, 0);
-            f->last_ms = mono_ms ();
+            f->last_ms = pm_mono_ms ();
         }
 
         udp_reap_done (&st);
@@ -618,7 +584,7 @@ open_listener (PortmuxRoute *r)
 {
     struct sockaddr_storage ss;
     socklen_t sslen;
-    int socktype = (r->proto == PORTMUX_PROTO_TCP) ? SOCK_STREAM : SOCK_DGRAM;
+    int socktype = (r->proto == PORTMUX_PROTO_UDP) ? SOCK_DGRAM : SOCK_STREAM;
     int family, fd, on = 1;
 
     family = portmux_resolve (r->listen_addr, r->listen_port, socktype, 1, &ss,
@@ -664,10 +630,10 @@ event_task_entry (void *data)
     char b;
 
     hev_task_add_fd (hev_task_self (), self->event_fds[0], POLLIN);
-    /* Use the run_yielder so a spurious wake re-checks self->run instead of
+    /* Use the pm_run_yielder so a spurious wake re-checks self->run instead of
        blocking; loop until a real stop byte arrives. */
     for (;;) {
-        ssize_t n = hev_task_io_read (self->event_fds[0], &b, 1, run_yielder,
+        ssize_t n = hev_task_io_read (self->event_fds[0], &b, 1, pm_run_yielder,
                                       self);
         if (n == 1)       /* stop requested */
             break;
@@ -675,7 +641,7 @@ event_task_entry (void *data)
             break;
         if (n == 0)       /* peer closed */
             break;
-        /* n < 0 with EAGAIN: run_yielder already yielded; loop. */
+        /* n < 0 with EAGAIN: pm_run_yielder already yielded; loop. */
     }
     self->run = 0;
     pm_wake_all_tasks (self);
@@ -716,7 +682,8 @@ portmux_add_route (Portmux *self, PortmuxProto proto, const char *listen_addr,
     snprintf (r->listen_addr, sizeof (r->listen_addr), "%s",
               listen_addr ? listen_addr : "0.0.0.0");
     r->listen_port = listen_port;
-    snprintf (r->target_addr, sizeof (r->target_addr), "%s", target_addr);
+    snprintf (r->target_addr, sizeof (r->target_addr), "%s",
+              target_addr ? target_addr : "");
     r->target_port = target_port;
     r->owner = self;
     r->listen_fd = -1;
@@ -728,6 +695,17 @@ portmux_add_route (Portmux *self, PortmuxProto proto, const char *listen_addr,
 
     self->route_count++;
     return 0;
+}
+
+int
+portmux_add_socks (Portmux *self, const char *listen_addr, int listen_port,
+                   const PortmuxEgress *egress)
+{
+    /* A SOCKS5 route is a route with a dynamic (per-connection) target, so it
+       reuses the route storage with no fixed target. */
+    return portmux_add_route (self, PORTMUX_PROTO_SOCKS5,
+                              listen_addr ? listen_addr : "127.0.0.1",
+                              listen_port, NULL, 0, egress);
 }
 
 /* Runs as the single bootstrap task. Opens listeners and spawns the event
@@ -756,14 +734,20 @@ bootstrap_task_entry (void *data)
             r->listen_fd = -1;
             continue;
         }
-        if (r->proto == PORTMUX_PROTO_TCP)
+        if (r->proto == PORTMUX_PROTO_SOCKS5)
+            hev_task_run (task, pm_socks_listen_task, r);
+        else if (r->proto == PORTMUX_PROTO_TCP)
             hev_task_run (task, tcp_listen_task, r);
         else
             hev_task_run (task, udp_listen_task, r);
-        PM_LOG_I ("route: %s %s:%d -> %s:%d",
-                  r->proto == PORTMUX_PROTO_TCP ? "tcp" : "udp",
-                  r->listen_addr, r->listen_port, r->target_addr,
-                  r->target_port);
+        if (r->proto == PORTMUX_PROTO_SOCKS5)
+            PM_LOG_I ("route: socks5 %s:%d (dynamic target)",
+                      r->listen_addr, r->listen_port);
+        else
+            PM_LOG_I ("route: %s %s:%d -> %s:%d",
+                      r->proto == PORTMUX_PROTO_TCP ? "tcp" : "udp",
+                      r->listen_addr, r->listen_port, r->target_addr,
+                      r->target_port);
         opened++;
     }
 

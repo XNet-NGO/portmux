@@ -28,6 +28,12 @@ typedef enum
 {
     PORTMUX_PROTO_TCP,
     PORTMUX_PROTO_UDP,
+    /* SOCKS5: the listener is a SOCKS5 proxy. The per-connection target is
+       supplied by the client in the SOCKS5 request (CONNECT / UDP ASSOCIATE),
+       not fixed on the route. Added via portmux_add_socks(). Every upstream
+       socket still passes through the route's PortmuxEgress, so egress pinning
+       is applied per client connection. */
+    PORTMUX_PROTO_SOCKS5,
 } PortmuxProto;
 
 /**
@@ -120,6 +126,24 @@ Portmux *portmux_new (void);
 int portmux_add_route (Portmux *self, PortmuxProto proto,
                        const char *listen_addr, int listen_port,
                        const char *target_addr, int target_port,
+                       const PortmuxEgress *egress);
+
+/**
+ * portmux_add_socks:
+ * @self: a #Portmux
+ * @listen_addr: local bind address (e.g. "127.0.0.1", "::1")
+ * @listen_port: local port to listen on for SOCKS5 clients
+ * @egress: egress policy applied to every upstream socket the proxy opens
+ *          (may be NULL for PORTMUX_EGRESS_NONE). This is what makes the
+ *          proxy's upstream pinnable per connection (e.g. Android
+ *          android_setsocknetwork via PORTMUX_EGRESS_CALLBACK), with no root.
+ *
+ * Register a SOCKS5 proxy listener. Unlike portmux_add_route, there is no fixed
+ * target: each accepted client supplies the destination in the SOCKS5 request.
+ * Supports no-auth (method 0x00), CONNECT (TCP) and UDP ASSOCIATE. Must be
+ * called before portmux_run(). Returns 0 on success, < 0 on error.
+ */
+int portmux_add_socks (Portmux *self, const char *listen_addr, int listen_port,
                        const PortmuxEgress *egress);
 
 /**
