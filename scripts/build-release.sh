@@ -88,7 +88,7 @@ cp bin/libportmux.a bin/portmux "$DIST/$HOST_TAG/"
 cp third-part/hev-task-system/bin/libhev-task-system.a "$DIST/$HOST_TAG/"
 
 # ---- Public header ----
-cp include/portmux.h "$DIST/include/"
+cp include/portmux.h include/portmux-tunnel.h "$DIST/include/"
 
 # ---- Manifest ----
 cat > "$DIST/MANIFEST.txt" <<EOF
@@ -106,6 +106,7 @@ $(cd "$DIST" && find "$HOST_TAG" -type f | sort | sed 's/^/  /')
 
 Header:
   include/portmux.h
+  include/portmux-tunnel.h
 EOF
 echo "=== MANIFEST ==="
 cat "$DIST/MANIFEST.txt"
