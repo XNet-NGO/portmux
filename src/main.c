@@ -31,6 +31,7 @@ usage (const char *argv0)
         "usage: %s [-v] ROUTE [ROUTE ...]\n"
         "\n"
         "ROUTE: PROTO:LADDR:LPORT:TADDR:TPORT[:EGRESS]\n"
+        "       socks:LADDR:LPORT[:EGRESS]     (SOCKS5 proxy, dynamic target)\n"
         "  PROTO  tcp | udp\n"
         "  LADDR  listen address (use 0.0.0.0 / :: for any; [::1] for v6 lit)\n"
         "  EGRESS (optional) dev=IFNAME | src=IP\n"
@@ -39,8 +40,10 @@ usage (const char *argv0)
         "  # MCP server :39811 -> reverse-ssh local forward :2222 (loopback)\n"
         "  %s tcp:127.0.0.1:39811:127.0.0.1:2222\n"
         "  # DAW -> VST app, udp, pin egress to wlan0\n"
-        "  %s udp:127.0.0.1:9000:127.0.0.1:9001:dev=wlan0\n",
-        argv0, argv0, argv0);
+        "  %s udp:127.0.0.1:9000:127.0.0.1:9001:dev=wlan0\n"
+        "  # SOCKS5 proxy on :1080, upstream pinned to wlan0\n"
+        "  %s socks:127.0.0.1:1080:dev=wlan0\n",
+        argv0, argv0, argv0, argv0);
 }
 
 /* Split "a:b:c:d:e[:f]" honoring a single [..] bracketed v6 literal in fields.
@@ -78,6 +81,26 @@ parse_route (char *spec, Portmux *pm)
     }
 
     if (nf < 5) {
+        /* socks:LADDR:LPORT[:EGRESS] has 3-4 fields with a dynamic target. */
+        if (nf >= 3 && strcmp (fields[0], "socks") == 0) {
+            PortmuxEgress eg = { 0 };
+            PortmuxEgress *egp = NULL;
+            if (nf == 4 && fields[3] && *fields[3]) {
+                if (strncmp (fields[3], "dev=", 4) == 0) {
+                    eg.kind = PORTMUX_EGRESS_DEVICE;
+                    eg.device = fields[3] + 4;
+                    egp = &eg;
+                } else if (strncmp (fields[3], "src=", 4) == 0) {
+                    eg.kind = PORTMUX_EGRESS_SOURCE;
+                    eg.source_ip = fields[3] + 4;
+                    egp = &eg;
+                } else {
+                    fprintf (stderr, "bad egress: %s\n", fields[3]);
+                    return -1;
+                }
+            }
+            return portmux_add_socks (pm, fields[1], atoi (fields[2]), egp);
+        }
         fprintf (stderr, "bad route (need 5-6 fields): %s\n", spec);
         return -1;
     }

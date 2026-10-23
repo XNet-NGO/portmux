@@ -21,6 +21,7 @@ LDFLAGS += -L$(HTS)/bin -lhev-task-system -lpthread
 
 LIB_SRCS = $(SRCDIR)/portmux.c \
            $(SRCDIR)/portmux-egress.c \
+           $(SRCDIR)/portmux-socks.c \
            $(SRCDIR)/portmux-addr.c
 LIB_OBJS = $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(LIB_SRCS))
 
@@ -71,6 +72,10 @@ test: $(STATIC) $(HTS_LIB)
 		$(LIB_SRCS) tests/test_udp_evict.c -o $(BUILDDIR)/test_udp_evict $(LDFLAGS)
 	@echo "RUN   test_udp_evict"
 	@$(BUILDDIR)/test_udp_evict
+	@echo "CC    tests/test_socks"
+	$(CC) $(PM_CFLAGS) tests/test_socks.c $(STATIC) -o $(BUILDDIR)/test_socks $(LDFLAGS)
+	@echo "RUN   test_socks"
+	@$(BUILDDIR)/test_socks
 
 clean:
 	rm -rf $(BUILDDIR) $(BINDIR)
