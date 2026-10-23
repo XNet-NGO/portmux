@@ -5,8 +5,9 @@ relays. No TUN device, no VPN permission, no root required for the loopback and
 source-bind cases. Built on the [hev-task-system](https://github.com/heiher/hev-task-system)
 coroutine runtime — the same scheduler used by hev-socks5-tunnel — but with **no
 lwIP**: it moves bytes between real kernel sockets. It also includes an optional
-**SOCKS5 proxy** inbound (CONNECT + UDP ASSOCIATE) that reuses the same
-socket-level relay and egress machinery — still no lwIP and no TUN.
+**SOCKS5 proxy** inbound (CONNECT + UDP ASSOCIATE) and an optional **encrypted
+tunnel** (Noise `NoisePSK_NN`, IP + pre-shared key) — both reuse the same
+socket-level relay and egress machinery, still with no lwIP and no TUN.
 
 ## Why not lwIP?
 
@@ -105,6 +106,41 @@ connection** by the SOCKS client, not baked into the route.
 
 A SOCKS5 proxy dials arbitrary destinations by design; expose it deliberately
 (loopback bind, and in higher layers behind an explicit allow flag).
+
+## Encrypted tunnel (NoisePSK_NN)
+
+An optional **encrypted rendezvous tunnel** carries a plaintext TCP service
+across an untrusted network with **no TUN, no root, and IP + pre-shared key
+only** (no certificates, no PKI). It is a focused tunneling proxy — not a system
+VPN — ideal for e.g. reaching a device's `adbd` from a remote box.
+
+- **Crypto:** Noise pattern `NN` with a pre-shared key (`NoisePSK_NN`, i.e. the
+  NNpsk0 construction): ephemeral X25519 (forward secrecy) authenticated by a
+  32-byte PSK. Cipher is AES-256-GCM (hardware-accelerated on ARMv8) or
+  ChaCha20-Poly1305; hash BLAKE2s. Vendored [noise-c](https://github.com/rweather/noise-c)
+  reference backend (see `third-part/noise-c`), compiled into `libportmux.a`.
+- **Shape (Scenario B — rendezvous):** the CLIENT makes ONE outbound encrypted
+  connection to the SERVER (NAT/firewall friendly). The server exposes a local
+  plaintext *bridge* port; a connection there is relayed, encrypted, to the
+  client, which splices it to a local plaintext *target*.
+- **Framing:** `[u16 length][Noise message]` for handshake and transport.
+- **Egress:** the client's outbound leg honors `PortmuxEgress`, so the tunnel
+  itself can be pinned to a chosen network (e.g. cellular) with no root.
+
+```sh
+# on the box (server): accept clients on :7000, expose an adb bridge on :5555
+portmux tunnel-server 0.0.0.0:7000 127.0.0.1:5555 ~/.ssh/xnet-tunnel.psk
+
+# on the phone/device (client): dial the box, splice to local adbd:5555
+portmux tunnel-client BOX_IP:7000 127.0.0.1:5555 ~/.ssh/xnet-tunnel.psk
+
+# then, on the box:
+adb connect 127.0.0.1:5555     # adb speaks to the device's adbd over the tunnel
+```
+
+The PSK file is 32 raw bytes or 64 hex chars. A wrong PSK fails the handshake —
+no data flows. v1 serves a single bridge connection per client session (enough
+for one `adb` session); connection multiplexing is future work.
 
 ## Library API
 
