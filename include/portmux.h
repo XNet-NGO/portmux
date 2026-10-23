@@ -34,6 +34,11 @@ typedef enum
        socket still passes through the route's PortmuxEgress, so egress pinning
        is applied per client connection. */
     PORTMUX_PROTO_SOCKS5,
+    /* Encrypted rendezvous tunnel (see portmux-tunnel.h). Registered via
+       portmux_add_tunnel_client()/portmux_add_tunnel_server(), not
+       portmux_add_route(). */
+    PORTMUX_PROTO_TUNNEL_CLIENT,
+    PORTMUX_PROTO_TUNNEL_SERVER,
 } PortmuxProto;
 
 /**
