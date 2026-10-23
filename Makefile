@@ -60,7 +60,7 @@ $(BUILDDIR)/%.o: $(SRCDIR)/%.c | $(BUILDDIR)
 $(BUILDDIR)/noise/%.o: $(NOISE_DIR)/%.c
 	@mkdir -p $(dir $@)
 	@echo "CC    $< (noise)"
-	$(CC) -O2 -std=gnu11 -w $(NOISE_INC) $(NOISE_DEFS) -c $< -o $@
+	$(CC) -O2 -std=gnu11 -w $(CFLAGS) $(EXTRA_CFLAGS) $(NOISE_INC) $(NOISE_DEFS) -c $< -o $@
 
 $(STATIC): $(LIB_OBJS) $(NOISE_OBJS)
 	@mkdir -p $(BINDIR)
