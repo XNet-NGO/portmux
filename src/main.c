@@ -11,6 +11,7 @@
 #include <signal.h>
 
 #include "portmux.h"
+#include "portmux-tunnel.h"
 
 extern int portmux_log_level;
 
@@ -23,6 +24,53 @@ on_signal (int sig)
     if (g_pm)
         portmux_stop (g_pm);
 }
+
+/* Load a 32-byte PSK. The file may be raw 32 bytes or 64 hex chars (optionally
+   with a trailing newline / "0x" prefix). Returns 0 on success. */
+static int
+load_psk (const char *path, unsigned char out[PM_TUNNEL_PSK_LEN])
+{
+    FILE *f = fopen (path, "rb");
+    if (!f) {
+        fprintf (stderr, "psk: cannot open %s\n", path);
+        return -1;
+    }
+    unsigned char buf[256];
+    size_t n = fread (buf, 1, sizeof buf, f);
+    fclose (f);
+
+    /* strip trailing whitespace */
+    while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r' || buf[n - 1] == ' '))
+        n--;
+
+    if (n == PM_TUNNEL_PSK_LEN) {            /* raw 32 bytes */
+        memcpy (out, buf, PM_TUNNEL_PSK_LEN);
+        return 0;
+    }
+    /* hex: allow optional 0x prefix */
+    size_t off = (n >= 2 && buf[0] == '0' && (buf[1] == 'x' || buf[1] == 'X')) ? 2 : 0;
+    if (n - off == PM_TUNNEL_PSK_LEN * 2) {
+        for (int i = 0; i < PM_TUNNEL_PSK_LEN; i++) {
+            unsigned v;
+            if (sscanf ((const char *)buf + off + i * 2, "%2x", &v) != 1)
+                return -1;
+            out[i] = (unsigned char)v;
+        }
+        return 0;
+    }
+    fprintf (stderr, "psk: %s must be 32 raw bytes or 64 hex chars (got %zu)\n",
+             path, n);
+    return -1;
+}
+
+static PmTunnelCipher
+parse_cipher (const char *s)
+{
+    if (s && (strcmp (s, "chacha") == 0 || strcmp (s, "chachapoly") == 0))
+        return PM_TUNNEL_CIPHER_CHACHAPOLY;
+    return PM_TUNNEL_CIPHER_AESGCM; /* default: HW-accelerated on ARMv8 */
+}
+
 
 static void
 usage (const char *argv0)
@@ -42,8 +90,18 @@ usage (const char *argv0)
         "  # DAW -> VST app, udp, pin egress to wlan0\n"
         "  %s udp:127.0.0.1:9000:127.0.0.1:9001:dev=wlan0\n"
         "  # SOCKS5 proxy on :1080, upstream pinned to wlan0\n"
-        "  %s socks:127.0.0.1:1080:dev=wlan0\n",
-        argv0, argv0, argv0, argv0);
+        "  %s socks:127.0.0.1:1080:dev=wlan0\n"
+        "\n"
+        "encrypted tunnel (NoisePSK_NN, IP + pre-shared key; no certs):\n"
+        "  %s tunnel-server LISTEN_ADDR:LISTEN_PORT BRIDGE_ADDR:BRIDGE_PORT PSKFILE [CIPHER]\n"
+        "  %s tunnel-client SERVER_ADDR:SERVER_PORT TARGET_ADDR:TARGET_PORT PSKFILE [CIPHER]\n"
+        "    CIPHER  aesgcm (default) | chacha\n"
+        "    PSKFILE 32 raw bytes or 64 hex chars (e.g. ~/.ssh/xnet-tunnel.psk)\n"
+        "  # on the box: accept clients on :7000, expose adb bridge on :5555\n"
+        "  %s tunnel-server 0.0.0.0:7000 127.0.0.1:5555 ~/.ssh/xnet-tunnel.psk\n"
+        "  # on the phone: dial the box, splice to local adbd:5555\n"
+        "  %s tunnel-client SERVER_IP:7000 127.0.0.1:5555 ~/.ssh/xnet-tunnel.psk\n",
+        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 /* Split "a:b:c:d:e[:f]" honoring a single [..] bracketed v6 literal in fields.
@@ -154,6 +212,55 @@ main (int argc, char **argv)
     if (first >= argc) {
         usage (argv[0]);
         return 1;
+    }
+
+    /* Tunnel subcommands: tunnel-server / tunnel-client. */
+    if (strcmp (argv[first], "tunnel-server") == 0 ||
+        strcmp (argv[first], "tunnel-client") == 0) {
+        int is_server = (strcmp (argv[first], "tunnel-server") == 0);
+        /* need: <cmd> A:B C:D PSKFILE [CIPHER] */
+        if (argc - first < 4) {
+            usage (argv[0]);
+            return 1;
+        }
+        char a1[256], a2[256];
+        snprintf (a1, sizeof a1, "%s", argv[first + 1]);
+        snprintf (a2, sizeof a2, "%s", argv[first + 2]);
+        const char *pskfile = argv[first + 3];
+        PmTunnelCipher cipher = parse_cipher (argc - first >= 5 ? argv[first + 4] : NULL);
+
+        char *c1 = strrchr (a1, ':'), *c2 = strrchr (a2, ':');
+        if (!c1 || !c2) { fprintf (stderr, "expected ADDR:PORT\n"); return 1; }
+        *c1 = '\0'; *c2 = '\0';
+        const char *addr1 = a1; int port1 = atoi (c1 + 1);
+        const char *addr2 = a2; int port2 = atoi (c2 + 1);
+
+        unsigned char psk[PM_TUNNEL_PSK_LEN];
+        if (load_psk (pskfile, psk) < 0)
+            return 1;
+
+        g_pm = portmux_new ();
+        if (!g_pm) { fprintf (stderr, "portmux_new failed\n"); return 1; }
+
+        int rc;
+        if (is_server)
+            rc = portmux_add_tunnel_server (g_pm, addr1, port1, addr2, port2,
+                                            psk, cipher);
+        else
+            rc = portmux_add_tunnel_client (g_pm, NULL, 0, addr1, port1,
+                                            addr2, port2, psk, cipher, NULL);
+        /* wipe the local PSK copy from this stack frame */
+        memset (psk, 0, sizeof psk);
+        if (rc < 0) {
+            fprintf (stderr, "tunnel setup failed\n");
+            portmux_destroy (g_pm);
+            return 1;
+        }
+        signal (SIGINT, on_signal);
+        signal (SIGTERM, on_signal);
+        rc = portmux_run (g_pm);
+        portmux_destroy (g_pm);
+        return rc == 0 ? 0 : 1;
     }
 
     g_pm = portmux_new ();
