@@ -726,6 +726,33 @@ bootstrap_task_entry (void *data)
 
     for (i = 0; i < self->route_count; i++) {
         PortmuxRoute *r = &self->routes[i];
+
+        /* Tunnel client: no listener, just dial out. */
+        if (r->proto == PORTMUX_PROTO_TUNNEL_CLIENT) {
+            task = hev_task_new (-1);
+            if (!task)
+                continue;
+            hev_task_run (task, pm_tunnel_client_entry, r);
+            PM_LOG_I ("route: tunnel-client");
+            opened++;
+            continue;
+        }
+        /* Tunnel server: open the encrypted + bridge listeners itself. */
+        if (r->proto == PORTMUX_PROTO_TUNNEL_SERVER) {
+            if (pm_tunnel_open_server (r) < 0)
+                continue;
+            task = hev_task_new (-1);
+            if (!task) {
+                close (r->listen_fd);
+                r->listen_fd = -1;
+                continue;
+            }
+            hev_task_run (task, pm_tunnel_server_entry, r);
+            PM_LOG_I ("route: tunnel-server");
+            opened++;
+            continue;
+        }
+
         if (open_listener (r) < 0)
             continue;
         task = hev_task_new (-1);

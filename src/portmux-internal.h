@@ -84,4 +84,15 @@ int pm_make_upstream_fd (PortmuxRoute *r, int family, int socktype);
 /* The SOCKS5 listener task entry (portmux-socks.c). Spawned per SOCKS route. */
 void pm_socks_listen_task (void *data);
 
+/* ── tunnel (portmux-tunnel.c) ── */
+/* Register a tunnel route, stashing the opaque PmTunnelCfg* on the route and
+   marking it as a tunnel client (is_server=0) or server (is_server=1). Returns
+   0 on success. Defined in portmux-tunnel.c (uses the public route array). */
+int pm_register_tunnel_route (Portmux *self, void *cfg, int is_server);
+/* Bootstrap-dispatched task entries. */
+void pm_tunnel_server_entry (void *route);
+void pm_tunnel_client_entry (void *route);
+/* Open a tunnel server's listeners before spawning its task. Returns 0/-1. */
+int pm_tunnel_open_server (PortmuxRoute *route);
+
 #endif /* __PORTMUX_INTERNAL_H__ */
