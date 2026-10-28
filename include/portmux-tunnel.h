@@ -49,13 +49,40 @@
 
  - Handshake: two framed messages (-> e ; <- e, ee), per Noise NN.
  - Transport: each framed payload is a Noise transport message (AEAD box).
-   Max Noise message is 65535 bytes, so plaintext per frame is capped at
-   65535 - 16 (AEAD tag) = 65519 bytes; the relay chunks larger reads.
- - A clean half-close is signalled by TCP FIN after the last frame; the relay
-   tears the paired socket down.
 
- There is no additional application header: the tunnel is a transparent,
- bidirectional, ordered byte pipe once the handshake completes.
+ STREAM MUX (B1: transparent L4 port-map, no bridge)
+ ---------------------------------------------------
+ The decrypted payload of each transport frame is NOT a raw byte slice; it is a
+ mux record so that MANY independent connections share ONE persistent Noise
+ carrier (like WireGuard carries many flows over one UDP session, but done in
+ userspace since there is no TUN):
+
+     [ u8 type ][ u16 stream-id (BE) ][ payload ... ]
+
+       type 0x01 OPEN   : server->client, open a new stream; client connects to
+                          its local target (adbd). No payload.
+       type 0x02 DATA   : either direction; payload is the stream's bytes.
+       type 0x03 CLOSE  : either direction; the stream's socket closed. No payload.
+
+ Topology (phone behind CGNAT still dials OUT; the box's public port is now the
+ PLAINTEXT adb endpoint — true 1:1, no separate bridge port to think about):
+
+     adb --(plain)--> box:PUBLIC  ──┐  (server assigns a stream-id,
+                                    │   frames OPEN/DATA/CLOSE)
+                      box:CARRIER <─┘  one persistent Noise session
+                          ▲   │         (phone dialed in, held open)
+            Noise-encrypted│   │
+                           │   ▼
+                         phone (carrier client) demuxes streams
+                           │  plain connect per stream
+                           ▼
+                   target 127.0.0.1:5555 (adbd)
+
+ - Max Noise message is 65535 bytes; the mux header is 3 bytes, so DATA payload
+   per frame is capped at PM_TUNNEL_MAX_PLAINTEXT - 3; the relay chunks larger
+   reads. Overhead is ~3 bytes per frame on top of the 16-byte AEAD tag.
+ - A stream's clean close is an explicit CLOSE record (not TCP FIN), so one
+   flow ending does not tear down the shared carrier.
  ============================================================================
 */
 
@@ -73,6 +100,13 @@ extern "C" {
 #define PM_TUNNEL_MAX_NOISE_MSG 65535
 #define PM_TUNNEL_AEAD_TAG      16
 #define PM_TUNNEL_MAX_PLAINTEXT (PM_TUNNEL_MAX_NOISE_MSG - PM_TUNNEL_AEAD_TAG)
+
+/* Stream-mux record types (first byte of each decrypted transport payload). */
+#define PM_MUX_OPEN   0x01
+#define PM_MUX_DATA   0x02
+#define PM_MUX_CLOSE  0x03
+#define PM_MUX_HDR    3            /* 1B type + 2B stream-id (BE) */
+#define PM_MUX_MAX_STREAMS 256     /* concurrent streams over one carrier */
 
 /* Cipher suite selector for the Noise name. */
 typedef enum

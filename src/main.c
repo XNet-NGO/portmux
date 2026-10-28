@@ -218,22 +218,48 @@ main (int argc, char **argv)
     if (strcmp (argv[first], "tunnel-server") == 0 ||
         strcmp (argv[first], "tunnel-client") == 0) {
         int is_server = (strcmp (argv[first], "tunnel-server") == 0);
-        /* need: <cmd> A:B C:D PSKFILE [CIPHER] */
-        if (argc - first < 4) {
-            usage (argv[0]);
-            return 1;
+
+        /* Server supports a SINGLE-PORT form (B1 peek-demux, no bridge):
+         *     tunnel-server LISTEN_ADDR:PORT PSKFILE [CIPHER]
+         * and the legacy two-port form:
+         *     tunnel-server LISTEN_ADDR:PORT PUBLIC_ADDR:PORT PSKFILE [CIPHER]
+         * The client always takes: tunnel-client SRV:PORT TARGET:PORT PSKFILE [CIPHER].
+         * Distinguish by whether the 2nd positional looks like ADDR:PORT. */
+        int single_port = 0;
+        if (is_server) {
+            const char *a2 = (argc - first >= 3) ? argv[first + 2] : NULL;
+            /* two-port iff a2 contains ':' AND there is still a PSKFILE after it */
+            int a2_is_addr = (a2 && strrchr (a2, ':') != NULL && (argc - first >= 4));
+            single_port = !a2_is_addr;
         }
+
+        int need = single_port ? 3 : 4;
+        if (argc - first < need) { usage (argv[0]); return 1; }
+
         char a1[256], a2[256];
         snprintf (a1, sizeof a1, "%s", argv[first + 1]);
-        snprintf (a2, sizeof a2, "%s", argv[first + 2]);
-        const char *pskfile = argv[first + 3];
-        PmTunnelCipher cipher = parse_cipher (argc - first >= 5 ? argv[first + 4] : NULL);
+        const char *pskfile;
+        PmTunnelCipher cipher;
+        const char *addr2 = NULL; int port2 = 0;
 
-        char *c1 = strrchr (a1, ':'), *c2 = strrchr (a2, ':');
-        if (!c1 || !c2) { fprintf (stderr, "expected ADDR:PORT\n"); return 1; }
-        *c1 = '\0'; *c2 = '\0';
+        char *c1 = strrchr (a1, ':');
+        if (!c1) { fprintf (stderr, "expected ADDR:PORT\n"); return 1; }
+        *c1 = '\0';
         const char *addr1 = a1; int port1 = atoi (c1 + 1);
-        const char *addr2 = a2; int port2 = atoi (c2 + 1);
+
+        if (single_port) {
+            pskfile = argv[first + 2];
+            cipher = parse_cipher (argc - first >= 4 ? argv[first + 3] : NULL);
+            /* single-port: no separate public listener (port2 = 0) */
+        } else {
+            snprintf (a2, sizeof a2, "%s", argv[first + 2]);
+            pskfile = argv[first + 3];
+            cipher = parse_cipher (argc - first >= 5 ? argv[first + 4] : NULL);
+            char *c2 = strrchr (a2, ':');
+            if (!c2) { fprintf (stderr, "expected ADDR:PORT\n"); return 1; }
+            *c2 = '\0';
+            addr2 = a2; port2 = atoi (c2 + 1);
+        }
 
         unsigned char psk[PM_TUNNEL_PSK_LEN];
         if (load_psk (pskfile, psk) < 0)
@@ -244,7 +270,8 @@ main (int argc, char **argv)
 
         int rc;
         if (is_server)
-            rc = portmux_add_tunnel_server (g_pm, addr1, port1, addr2, port2,
+            rc = portmux_add_tunnel_server (g_pm, addr1, port1,
+                                            addr2 ? addr2 : "127.0.0.1", port2,
                                             psk, cipher);
         else
             rc = portmux_add_tunnel_client (g_pm, NULL, 0, addr1, port1,
