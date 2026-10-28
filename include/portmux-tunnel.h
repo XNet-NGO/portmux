@@ -108,8 +108,70 @@ extern "C" {
 #define PM_MUX_OPEN   0x01
 #define PM_MUX_DATA   0x02
 #define PM_MUX_CLOSE  0x03
+#define PM_MUX_OPENJ  0x04         /* OPEN-with-jumps: multi-hop source route  */
 #define PM_MUX_HDR    3            /* 1B type + 2B stream-id (BE) */
 #define PM_MUX_MAX_STREAMS 256     /* concurrent streams per direction        */
+
+/* ── Multi-hop jump routing (explicit source routing, hop-by-hop Noise) ──
+ * An OPENJ record carries an ordered jump-list so one forward stream can be
+ * relayed across several peers before reaching the final target, each hop a
+ * separate Noise carrier (hop-by-hop encryption; single shared PSK in v1):
+ *
+ *   edge --plain--> peerA --Noise--> peerB --Noise--> peerC --plain--> target
+ *          OPENJ [B,C,target]   OPENJ [C,target]   OPENJ [] -> connect target
+ *
+ * OPENJ payload (after the 3-byte mux header [0x04][u16 id]):
+ *
+ *   [ u8 proto ][ u8 nhops ][ nhops × hop ][ final-target ]
+ *      hop          = [ u8 alen ][ alen addr bytes ][ u16 port (BE) ]
+ *      final-target = [ u8 alen ][ alen addr bytes ][ u16 port (BE) ]
+ *
+ * A peer that receives OPENJ with nhops>0 pops hop[0], dials it as a new
+ * carrier, and forwards OPENJ with nhops-1 and the remaining list. nhops==0 is
+ * the terminal case: connect final-target locally (identical to a plain OPEN).
+ * OPENJ is only valid on the FORWARD origin half (reverse multi-hop is future).
+ * proto applies to the FINAL target only; inter-peer hops are always TCP. */
+#define PM_MUX_MAX_HOPS   8        /* cap jump-list length (anti-loop/amplify) */
+#define PM_MUX_ADDR_MAX   128      /* max address string per hop/target        */
+
+/* A single endpoint (hop or final target) in a jump-list. */
+typedef struct
+{
+    char addr[PM_MUX_ADDR_MAX];    /* NUL-terminated host/IP                   */
+    int  port;                     /* 1..65535                                 */
+} PmJumpEndpoint;
+
+/* A decoded jump-list: @nhops intermediate peers + a @target. */
+typedef struct
+{
+    unsigned char  proto;                       /* PM_MUX_PROTO_* (final leg)  */
+    int            nhops;                        /* 0..PM_MUX_MAX_HOPS          */
+    PmJumpEndpoint hops[PM_MUX_MAX_HOPS];        /* ordered next-hops           */
+    PmJumpEndpoint target;                       /* final destination           */
+} PmJumpList;
+
+/**
+ * pm_jumplist_encode:
+ * Serialize @jl into @out (capacity @cap), producing the OPENJ payload (the
+ * bytes AFTER the 3-byte mux header). Returns the byte count written, or -1 on
+ * error (too many hops, address too long, bad port, or buffer too small).
+ */
+int pm_jumplist_encode (const PmJumpList *jl, unsigned char *out, size_t cap);
+
+/**
+ * pm_jumplist_decode:
+ * Parse an OPENJ payload (@pl, @pn bytes) into @jl. Returns 0 on success, -1 on
+ * malformed/oversized input. On success @jl is fully populated.
+ */
+int pm_jumplist_decode (const unsigned char *pl, size_t pn, PmJumpList *jl);
+
+/**
+ * pm_jumplist_pop:
+ * Produce the jump-list to send to the NEXT hop: copies @in to @out with the
+ * first hop removed (nhops-1). Requires @in->nhops >= 1. Returns 0, or -1 if
+ * there are no hops to pop. The popped hop's address is returned via @next.
+ */
+int pm_jumplist_pop (const PmJumpList *in, PmJumpList *out, PmJumpEndpoint *next);
 
 /* Stream-id origin namespacing (symmetric mux). The 16-bit id's top bit marks
  * which END originated the stream, so both ends can open streams on one carrier
@@ -201,6 +263,35 @@ int portmux_tunnel_set_reverse_target (Portmux *self,
  * matching socket type per stream from the OPEN proto byte. Returns 0 on ok.
  */
 int portmux_tunnel_set_reverse_proto (Portmux *self, int proto);
+
+/**
+ * portmux_add_tunnel_peer:
+ * Register a PEER: a single-port (peek-demux) tunnel server that can ALSO relay
+ * OPENJ multi-hop streams onward. Accepts encrypted carriers on
+ * @listen_addr:@listen_port (like a server); when it receives an OPENJ with
+ * hops remaining it dials the next hop (honoring @egress) and splices. With
+ * nhops==0 it behaves as the terminal server (connect final target). Shares
+ * the single @psk/@cipher with every peer in the chain. Returns 0 on success.
+ */
+int portmux_add_tunnel_peer (Portmux *self,
+                             const char *listen_addr, int listen_port,
+                             const unsigned char psk[PM_TUNNEL_PSK_LEN],
+                             PmTunnelCipher cipher,
+                             const PortmuxEgress *egress);
+
+/**
+ * portmux_tunnel_set_jumps:
+ * Configure the EDGE originator's jump-list on the most-recently-added tunnel
+ * route (a server/peer acting as the chain's entry: it accepts local plaintext
+ * clients and emits OPENJ instead of plain OPEN). @hops is an ordered list of
+ * "addr:port" next-hops (the carrier dials hops[0]; the OPENJ carries hops[1..]
+ * + @target). @nhops in 0..PM_MUX_MAX_HOPS. @target_addr:@target_port is the
+ * final destination; @proto is PM_MUX_PROTO_* for the final leg. Returns 0 ok.
+ */
+int portmux_tunnel_set_jumps (Portmux *self,
+                              const PmJumpEndpoint *hops, int nhops,
+                              const char *target_addr, int target_port,
+                              int proto);
 
 #ifdef __cplusplus
 }

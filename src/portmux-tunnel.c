@@ -19,6 +19,8 @@
 #include <stdio.h>
 #include <errno.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>   /* TCP_MAXSEG */
@@ -46,6 +48,7 @@
 typedef struct
 {
     int is_server;                       /* 0 = client, 1 = server */
+    int is_peer;                         /* 1 => server that relays OPENJ onward */
     char server_addr[128];               /* client: where to dial         */
     int server_port;
     char target_addr[128];               /* client: local plaintext target */
@@ -71,6 +74,10 @@ typedef struct
     int rlisten_udp_fd;                  /* client: reverse UDP listener fd (-1) */
     char rtarget_addr[128];              /* server: reverse target addr */
     int rtarget_port;                    /* server: reverse target port (0=off) */
+    /* EDGE originator jump-list: when set (jump_set), a server/peer entry emits
+       OPENJ (multi-hop) instead of plain OPEN for each accepted local client. */
+    int jump_set;                        /* 1 => emit OPENJ with @jump */
+    PmJumpList jump;                     /* hops[0] is this entry's carrier dest */
 } PmTunnelCfg;
 
 /* reverse-listener proto set */
@@ -84,6 +91,101 @@ cipher_name (PmTunnelCipher c)
     return (c == PM_TUNNEL_CIPHER_AESGCM)
              ? "NoisePSK_NN_25519_AESGCM_BLAKE2s"
              : "NoisePSK_NN_25519_ChaChaPoly_BLAKE2s";
+}
+
+/* ───────────────────────── jump-list codec ─────────────────────────
+ * Wire form of an OPENJ payload (see portmux-tunnel.h for the full picture):
+ *   [ u8 proto ][ u8 nhops ][ nhops × hop ][ final-target ]
+ *     endpoint = [ u8 alen ][ alen addr bytes ][ u16 port (BE) ]
+ * Encoder/decoder are pure (no sockets); unit-tested in isolation. */
+
+/* Serialize one endpoint; returns bytes written or -1 on error. */
+static int
+jump_ep_encode (const PmJumpEndpoint *ep, unsigned char *out, size_t cap)
+{
+    size_t alen = strnlen (ep->addr, PM_MUX_ADDR_MAX);
+    if (alen == 0 || alen >= PM_MUX_ADDR_MAX) return -1;   /* empty or unterminated */
+    if (ep->port < 1 || ep->port > 65535) return -1;
+    size_t need = 1 + alen + 2;
+    if (cap < need) return -1;
+    out[0] = (unsigned char)alen;
+    memcpy (out + 1, ep->addr, alen);
+    out[1 + alen] = (unsigned char)((ep->port >> 8) & 0xff);
+    out[1 + alen + 1] = (unsigned char)(ep->port & 0xff);
+    return (int)need;
+}
+
+/* Parse one endpoint from @pl (@pn bytes). Returns bytes consumed or -1. */
+static int
+jump_ep_decode (const unsigned char *pl, size_t pn, PmJumpEndpoint *ep)
+{
+    if (pn < 1) return -1;
+    size_t alen = pl[0];
+    if (alen == 0 || alen >= PM_MUX_ADDR_MAX) return -1;
+    if (pn < 1 + alen + 2) return -1;
+    memcpy (ep->addr, pl + 1, alen);
+    ep->addr[alen] = '\0';
+    ep->port = ((int)pl[1 + alen] << 8) | (int)pl[1 + alen + 1];
+    if (ep->port < 1 || ep->port > 65535) return -1;
+    return (int)(1 + alen + 2);
+}
+
+int
+pm_jumplist_encode (const PmJumpList *jl, unsigned char *out, size_t cap)
+{
+    if (!jl || !out) return -1;
+    if (jl->nhops < 0 || jl->nhops > PM_MUX_MAX_HOPS) return -1;
+    if (jl->proto != PM_MUX_PROTO_TCP && jl->proto != PM_MUX_PROTO_UDP) return -1;
+    if (cap < 2) return -1;
+    size_t off = 0;
+    out[off++] = jl->proto;
+    out[off++] = (unsigned char)jl->nhops;
+    for (int i = 0; i < jl->nhops; i++) {
+        int n = jump_ep_encode (&jl->hops[i], out + off, cap - off);
+        if (n < 0) return -1;
+        off += (size_t)n;
+    }
+    int n = jump_ep_encode (&jl->target, out + off, cap - off);
+    if (n < 0) return -1;
+    off += (size_t)n;
+    return (int)off;
+}
+
+int
+pm_jumplist_decode (const unsigned char *pl, size_t pn, PmJumpList *jl)
+{
+    if (!pl || !jl || pn < 2) return -1;
+    memset (jl, 0, sizeof *jl);
+    size_t off = 0;
+    jl->proto = pl[off++];
+    if (jl->proto != PM_MUX_PROTO_TCP && jl->proto != PM_MUX_PROTO_UDP) return -1;
+    int nhops = pl[off++];
+    if (nhops < 0 || nhops > PM_MUX_MAX_HOPS) return -1;
+    jl->nhops = nhops;
+    for (int i = 0; i < nhops; i++) {
+        int n = jump_ep_decode (pl + off, pn - off, &jl->hops[i]);
+        if (n < 0) return -1;
+        off += (size_t)n;
+    }
+    int n = jump_ep_decode (pl + off, pn - off, &jl->target);
+    if (n < 0) return -1;
+    off += (size_t)n;
+    if (off != pn) return -1;                 /* trailing garbage -> reject */
+    return 0;
+}
+
+int
+pm_jumplist_pop (const PmJumpList *in, PmJumpList *out, PmJumpEndpoint *next)
+{
+    if (!in || !out || in->nhops < 1) return -1;
+    if (next) *next = in->hops[0];
+    memset (out, 0, sizeof *out);
+    out->proto  = in->proto;
+    out->nhops  = in->nhops - 1;
+    out->target = in->target;
+    for (int i = 0; i < out->nhops; i++)
+        out->hops[i] = in->hops[i + 1];
+    return 0;
 }
 
 /* ───────────────────────── MTU / MSS clamp ─────────────────────────
@@ -363,7 +465,40 @@ typedef struct
        connection is peeked on the shared listener. */
     const unsigned char *psk;    /* PM_TUNNEL_PSK_LEN bytes */
     PmTunnelCipher cipher;
+
+    /* PEER mode (multi-hop relay). A peer is a server that ALSO dials the next
+       hop on demand: when it receives OPENJ with nhops>0 it pops the first hop,
+       creates a socketpair (one end becomes this inbound stream's local fd, the
+       other is spliced to a freshly-dialed next-hop carrier), and forwards the
+       remaining jump-list as OPENJ. nhops==0 is terminal: connect final target
+       locally (same as a plain OPEN). Intermediate hops are always TCP. */
+    int is_peer;                 /* 1 => this ctx may relay OPENJ onward */
+    PortmuxEgress peer_egress;   /* egress for dialed next-hop carriers */
+    int peer_egress_valid;
+
+    /* EDGE originator: when jump_set, the client's reverse-listener accepts
+       local plaintext clients and emits OPENJ(@jump) instead of plain OPEN, so
+       the stream is source-routed across the jump-list. hops[0] of @jump is the
+       carrier's own destination (this ctx dialed it); the OPENJ carries
+       hops[1..] + target. */
+    int jump_set;
+    PmJumpList jump;
 } MuxCtx;
+
+/* A pending next-hop dial, handed to a dialer task. Dials @next as an initiator
+   carrier (shared PSK/cipher), sends OPENJ(@rest), and splices @local_fd (the
+   peer end of the inbound-stream socketpair) to that carrier's single stream. */
+typedef struct
+{
+    Portmux        *self;
+    int             local_fd;    /* our end of the socketpair (relay splice)  */
+    PmJumpEndpoint  next;        /* next-hop carrier to dial                  */
+    PmJumpList      rest;        /* jump-list to forward (nhops-1 + target)   */
+    const unsigned char *psk;
+    PmTunnelCipher  cipher;
+    PortmuxEgress   egress;
+    int             egress_valid;
+} PmPeerDial;
 
 /* Resolve a 16-bit stream id to its MuxStream slot (origin bit -> table half). */
 static MuxStream *
@@ -525,6 +660,19 @@ mux_connect_to (MuxCtx *m, const char *addr, int port, int proto)
     return fd;
 }
 
+/* Set O_NONBLOCK on a raw fd (socketpair ends; hev-task's own socket helpers
+   already do this, but socketpair()/accept() syscalls return blocking fds). */
+static void
+pm_mux_nonblock (int fd)
+{
+    int fl = fcntl (fd, F_GETFL, 0);
+    if (fl >= 0) fcntl (fd, F_SETFL, fl | O_NONBLOCK);
+}
+
+/* Spawn a next-hop dialer task (defined after the peer task). Returns 0/-1. */
+static int peer_spawn_dial (MuxCtx *m, int local_fd,
+                            const PmJumpEndpoint *next, const PmJumpList *rest);
+
 /* Dispatch one fully-received inbound carrier record. OPEN is bidirectional:
  * a FORWARD OPEN (origin bit clear) is handled by the CLIENT (connect to its
  * forward target); a REVERSE OPEN (origin bit set) is handled by the SERVER
@@ -558,6 +706,60 @@ mux_dispatch (MuxCtx *m, unsigned char type, unsigned int id,
         st->fd = fd;
         st->is_udp = (proto == PM_MUX_PROTO_UDP);
         PM_LOG_I ("tunnel: stream 0x%04x target connected fd=%d", id, fd);
+    } else if (type == PM_MUX_OPENJ) {
+        /* Multi-hop OPEN. Only valid on the forward half, received by a peer
+           (or a terminal server acting as the last hop). OPENJ is origin-
+           agnostic: it is always a forward request toward the target, whether
+           the carrier was dialed by the edge (client-originated id) or by an
+           upstream peer's dialer (server-originated id). Only the responder
+           end (peer/server) acts on it. */
+        if (!(m->is_peer || m->is_server)) { mux_queue_out (m, PM_MUX_CLOSE, id, NULL, 0); return; }
+        PmJumpList jl;
+        if (pm_jumplist_decode (pl, pn, &jl) < 0) {
+            PM_LOG_W ("tunnel: OPENJ decode failed (stream 0x%04x)", id);
+            mux_queue_out (m, PM_MUX_CLOSE, id, NULL, 0); return;
+        }
+        if (jl.nhops == 0) {
+            /* Terminal hop: connect the final target locally (like OPEN). */
+            PM_LOG_I ("tunnel: OPENJ stream 0x%04x terminal -> %s:%d (%s)",
+                      id, jl.target.addr, jl.target.port,
+                      jl.proto == PM_MUX_PROTO_UDP ? "udp" : "tcp");
+            int fd = mux_connect_to (m, jl.target.addr, jl.target.port, jl.proto);
+            if (fd < 0) { mux_queue_out (m, PM_MUX_CLOSE, id, NULL, 0); return; }
+            mux_close_stream (m, id);
+            st->fd = fd;
+            st->is_udp = (jl.proto == PM_MUX_PROTO_UDP);
+            return;
+        }
+        /* Relay hop: need peer mode (a dialer + egress). A plain server that is
+           not a peer cannot relay onward. */
+        if (!m->is_peer) {
+            PM_LOG_W ("tunnel: OPENJ with %d hops but not a peer (stream 0x%04x)", jl.nhops, id);
+            mux_queue_out (m, PM_MUX_CLOSE, id, NULL, 0); return;
+        }
+        PmJumpList rest; PmJumpEndpoint next;
+        if (pm_jumplist_pop (&jl, &rest, &next) < 0) { mux_queue_out (m, PM_MUX_CLOSE, id, NULL, 0); return; }
+        /* loop/self guard: refuse to dial our own listen endpoint */
+        if (next.port == m->accept_port) {
+            PM_LOG_W ("tunnel: OPENJ next-hop == self :%d; refusing (stream 0x%04x)", next.port, id);
+            mux_queue_out (m, PM_MUX_CLOSE, id, NULL, 0); return;
+        }
+        int sp[2];
+        if (socketpair (AF_UNIX, SOCK_STREAM, 0, sp) < 0) { mux_queue_out (m, PM_MUX_CLOSE, id, NULL, 0); return; }
+        /* sp[0] = this inbound stream's local fd (spliced carrier<->sp[0] by the
+           normal mux loop). sp[1] = handed to the next-hop dialer task. */
+        pm_mux_nonblock (sp[0]);
+        hev_task_add_fd (hev_task_self (), sp[0], POLLIN);
+        mux_close_stream (m, id);
+        st->fd = sp[0];
+        st->is_udp = 0;
+        PM_LOG_I ("tunnel: OPENJ stream 0x%04x relay -> next hop %s:%d (%d hop(s) left)",
+                  id, next.addr, next.port, rest.nhops);
+        if (peer_spawn_dial (m, sp[1], &next, &rest) < 0) {
+            mux_close_stream (m, id);       /* closes sp[0] */
+            close (sp[1]);
+            mux_queue_out (m, PM_MUX_CLOSE, id, NULL, 0);
+        }
     } else if (type == PM_MUX_DATA) {
         if (pn == 0) return;
         /* UDP reverse flow (client side): no own fd; deliver the datagram back
@@ -621,9 +823,23 @@ mux_reverse_accept_tcp (MuxCtx *m, int lfd)
         hev_task_add_fd (hev_task_self (), rfd, POLLIN);
         m->streams[1][slot].fd = rfd;
         m->streams[1][slot].is_udp = 0;
-        unsigned char proto = PM_MUX_PROTO_TCP;
-        if (mux_queue_out (m, PM_MUX_OPEN, id, &proto, 1) < 0) mux_close_stream (m, id);
-        else PM_LOG_I ("tunnel-client: reverse TCP client -> stream 0x%04x (OPEN)", id);
+        if (m->jump_set) {
+            /* EDGE originator: source-route this stream. hops[0] of m->jump is
+               THIS carrier's destination (already dialed); forward the rest. */
+            PmJumpList rest; PmJumpEndpoint first;
+            unsigned char jbuf[1 + 1 + PM_MUX_MAX_HOPS * (1 + PM_MUX_ADDR_MAX + 2) + (1 + PM_MUX_ADDR_MAX + 2)];
+            int jn;
+            if (m->jump.nhops >= 1) { pm_jumplist_pop (&m->jump, &rest, &first); }
+            else { rest = m->jump; }      /* single peer == terminal */
+            jn = pm_jumplist_encode (&rest, jbuf, sizeof jbuf);
+            if (jn < 0 || mux_queue_out (m, PM_MUX_OPENJ, id, jbuf, (size_t)jn) < 0)
+                mux_close_stream (m, id);
+            else PM_LOG_I ("tunnel-client: jump client -> stream 0x%04x (OPENJ, %d hop(s) after carrier)", id, rest.nhops);
+        } else {
+            unsigned char proto = PM_MUX_PROTO_TCP;
+            if (mux_queue_out (m, PM_MUX_OPEN, id, &proto, 1) < 0) mux_close_stream (m, id);
+            else PM_LOG_I ("tunnel-client: reverse TCP client -> stream 0x%04x (OPEN)", id);
+        }
         progress = 1;
     }
     return progress;
@@ -934,6 +1150,183 @@ peek_is_carrier (Portmux *self, int fd)
     return (b[0] == 0x00 && b[1] == PM_CARRIER_FIRST_LEN) ? 1 : 0;
 }
 
+/* ───────────────────────── peer: next-hop dialer ─────────────────────────
+ * A relay hop (peer receiving OPENJ with hops left) hands us one end of a
+ * socketpair (@local_fd) spliced to the inbound stream, plus the remaining
+ * jump-list. We dial @next as an initiator carrier (shared PSK), send an
+ * OPENJ(@rest) on stream 0x0001, then pump bytes both ways until either side
+ * closes. This is a minimal single-stream relay (not the full mux_run): the
+ * next hop sees exactly one forward stream whose "payload" is OPENJ then DATA.
+ */
+static int
+dialer_send_rec (int fd, NoiseCipherState *tx, unsigned char *scratch,
+                 unsigned char type, unsigned int id,
+                 const unsigned char *payload, size_t plen)
+{
+    unsigned char *body = scratch + 2;
+    body[0] = type;
+    body[1] = (unsigned char)((id >> 8) & 0xff);
+    body[2] = (unsigned char)(id & 0xff);
+    if (plen) memcpy (body + PM_MUX_HDR, payload, plen);
+    NoiseBuffer mb;
+    noise_buffer_set_inout (mb, body, PM_MUX_HDR + plen, PM_TUNNEL_MAX_NOISE_MSG);
+    if (noise_cipherstate_encrypt (tx, &mb) != NOISE_ERROR_NONE) return -1;
+    scratch[0] = (unsigned char)((mb.size >> 8) & 0xff);
+    scratch[1] = (unsigned char)(mb.size & 0xff);
+    size_t total = mb.size + 2, off = 0;
+    while (off < total) {
+        ssize_t s = send (fd, scratch + off, total - off, 0);
+        if (s > 0) { off += (size_t)s; continue; }
+        if (s < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { hev_task_yield (HEV_TASK_WAITIO); continue; }
+        return -1;
+    }
+    return 0;
+}
+
+static void
+peer_dialer_task (void *data)
+{
+    PmPeerDial *d = data;
+    Portmux *self = d->self;
+    PmTaskNode node;
+    NoiseCipherState *tx = NULL, *rx = NULL;
+    int cfd = -1;
+    unsigned char *scratch = NULL, *inbuf = NULL, *lbuf = NULL;
+
+    pm_task_register (self, &node);
+
+    struct sockaddr_storage ss; socklen_t sslen;
+    int family = portmux_resolve (d->next.addr, d->next.port, SOCK_STREAM, 0, &ss, &sslen);
+    if (family < 0) goto done;
+
+    {
+        PortmuxRoute tmp; memset (&tmp, 0, sizeof tmp);
+        tmp.egress = d->egress; tmp.egress_valid = d->egress_valid;
+        cfd = pm_make_upstream_fd (&tmp, family, SOCK_STREAM);
+    }
+    if (cfd < 0) goto done;
+    pm_clamp_mss (cfd); pm_set_keepalive (cfd);
+    hev_task_add_fd (hev_task_self (), cfd, POLLIN | POLLOUT);
+    if (hev_task_io_socket_connect (cfd, (struct sockaddr *)&ss, sslen,
+                                    pm_run_yielder, self) < 0) goto done;
+    pm_set_nodelay (cfd);
+    if (do_handshake (self, cfd, NOISE_ROLE_INITIATOR, d->psk, d->cipher, &tx, &rx) < 0) {
+        PM_LOG_W ("peer-dialer: handshake to %s:%d failed", d->next.addr, d->next.port);
+        goto done;
+    }
+    PM_LOG_I ("peer-dialer: carrier up to %s:%d; forwarding OPENJ (%d hop(s) left)",
+              d->next.addr, d->next.port, d->rest.nhops);
+
+    scratch = malloc (2 + PM_TUNNEL_MAX_NOISE_MSG);
+    inbuf   = malloc (PM_TUNNEL_MAX_NOISE_MSG);
+    lbuf    = malloc (PM_TUNNEL_MAX_PLAINTEXT - PM_MUX_HDR);
+    if (!scratch || !inbuf || !lbuf) goto done;
+
+    /* send OPENJ(rest) as the single forward stream 0x0001 */
+    {
+        unsigned char jbuf[1 + 1 + PM_MUX_MAX_HOPS * (1 + PM_MUX_ADDR_MAX + 2) + (1 + PM_MUX_ADDR_MAX + 2)];
+        int jn = pm_jumplist_encode (&d->rest, jbuf, sizeof jbuf);
+        if (jn < 0) goto done;
+        if (dialer_send_rec (cfd, tx, scratch, PM_MUX_OPENJ, 0x0001, jbuf, (size_t)jn) < 0) goto done;
+    }
+
+    pm_mux_nonblock (d->local_fd);
+    hev_task_add_fd (hev_task_self (), d->local_fd, POLLIN);
+
+    /* bidirectional pump: local_fd <-> carrier(stream 0x0001) */
+    {
+        size_t ihdr_got = 0, ibody_len = 0, ibody_got = 0; int have_ilen = 0;
+        unsigned char ihdr[2];
+        const size_t lcap = PM_TUNNEL_MAX_PLAINTEXT - PM_MUX_HDR;
+        int dead = 0;
+        while (self->run && !dead) {
+            int progress = 0;
+            /* local -> carrier (DATA) */
+            ssize_t r = recv (d->local_fd, lbuf, lcap, MSG_DONTWAIT);
+            if (r > 0) {
+                if (dialer_send_rec (cfd, tx, scratch, PM_MUX_DATA, 0x0001, lbuf, (size_t)r) < 0) break;
+                progress = 1;
+            } else if (r == 0) {
+                dialer_send_rec (cfd, tx, scratch, PM_MUX_CLOSE, 0x0001, NULL, 0);
+                break;
+            }
+            /* carrier -> local (decrypt records, write DATA to local_fd) */
+            for (int budget = 0; budget < 8; budget++) {
+                while (ihdr_got < 2) {
+                    ssize_t h = recv (cfd, ihdr + ihdr_got, 2 - ihdr_got, MSG_DONTWAIT);
+                    if (h > 0) { ihdr_got += (size_t)h; progress = 1; }
+                    else if (h == 0) { dead = 1; goto pump_yield; }
+                    else if (errno == EAGAIN || errno == EWOULDBLOCK) goto pump_yield;
+                    else { dead = 1; goto pump_yield; }
+                }
+                if (!have_ilen) {
+                    ibody_len = ((size_t)ihdr[0] << 8) | ihdr[1];
+                    ibody_got = 0; have_ilen = 1;
+                    if (ibody_len == 0 || ibody_len > PM_TUNNEL_MAX_NOISE_MSG) { dead = 1; goto pump_yield; }
+                }
+                while (ibody_got < ibody_len) {
+                    ssize_t b = recv (cfd, inbuf + ibody_got, ibody_len - ibody_got, MSG_DONTWAIT);
+                    if (b > 0) { ibody_got += (size_t)b; progress = 1; }
+                    else if (b == 0) { dead = 1; goto pump_yield; }
+                    else if (errno == EAGAIN || errno == EWOULDBLOCK) goto pump_yield;
+                    else { dead = 1; goto pump_yield; }
+                }
+                NoiseBuffer mb;
+                noise_buffer_set_inout (mb, inbuf, ibody_len, PM_TUNNEL_MAX_NOISE_MSG);
+                ihdr_got = 0; have_ilen = 0;
+                if (noise_cipherstate_decrypt (rx, &mb) != NOISE_ERROR_NONE) { dead = 1; goto pump_yield; }
+                if (mb.size >= PM_MUX_HDR) {
+                    unsigned char t = inbuf[0];
+                    if (t == PM_MUX_DATA) {
+                        unsigned char *p = inbuf + PM_MUX_HDR; size_t pn = mb.size - PM_MUX_HDR, off = 0;
+                        while (off < pn) {
+                            ssize_t s = send (d->local_fd, p + off, pn - off, MSG_DONTWAIT);
+                            if (s > 0) { off += (size_t)s; continue; }
+                            if (s < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { hev_task_yield (HEV_TASK_YIELD); continue; }
+                            dead = 1; break;
+                        }
+                    } else if (t == PM_MUX_CLOSE) { dead = 1; }
+                }
+            }
+        pump_yield:
+            if (!progress) hev_task_yield (HEV_TASK_WAITIO);
+            else hev_task_yield (HEV_TASK_YIELD);
+        }
+    }
+
+done:
+    if (tx) noise_cipherstate_free (tx);
+    if (rx) noise_cipherstate_free (rx);
+    free (scratch); free (inbuf); free (lbuf);
+    if (d->local_fd >= 0) { hev_task_del_fd (hev_task_self (), d->local_fd); close (d->local_fd); }
+    if (cfd >= 0) { hev_task_del_fd (hev_task_self (), cfd); close (cfd); }
+    pm_task_unregister (self, &node);
+    free (d);
+}
+
+/* Spawn a dialer task for a relay hop. Takes ownership of @local_fd on success
+ * (and always frees its own heap). Returns 0 on spawn, -1 on error. */
+static int
+peer_spawn_dial (MuxCtx *m, int local_fd,
+                 const PmJumpEndpoint *next, const PmJumpList *rest)
+{
+    PmPeerDial *d = calloc (1, sizeof *d);
+    if (!d) return -1;
+    d->self = m->self;
+    d->local_fd = local_fd;
+    d->next = *next;
+    d->rest = *rest;
+    d->psk = m->psk;
+    d->cipher = m->cipher;
+    d->egress = m->peer_egress;
+    d->egress_valid = m->peer_egress_valid;
+
+    HevTask *task = hev_task_new (-1);
+    if (!task) { free (d); return -1; }
+    hev_task_run (task, peer_dialer_task, d);
+    return 0;
+}
+
 /* ───────────────────────── client ─────────────────────────
  * Dial the server (egress-pinned), handshake as initiator, connect the local
  * plaintext target, and relay. Reconnect/backoff is left to the caller layer;
@@ -1038,6 +1431,14 @@ tunnel_client_task (void *data)
             m->rlisten_tcp_fd = cfg->rlisten_tcp_fd;
             m->rlisten_udp_fd = cfg->rlisten_udp_fd;
             m->rlisten_port = cfg->rlisten_port;
+            /* EDGE jump mode: emit OPENJ on the reverse listener, and allow
+               this ctx's dialer path to reuse the route egress (unused on the
+               edge, but harmless). */
+            m->jump_set = cfg->jump_set;
+            m->jump = cfg->jump;
+            m->psk = cfg->psk;
+            m->peer_egress = cfg->egress;
+            m->peer_egress_valid = cfg->egress_valid;
             mux_run (m);
             free (m);
         }
@@ -1109,6 +1510,9 @@ tunnel_server_task (void *data)
     m->accept_fd = cfg->listen_fd;     /* the single public listener           */
     m->accept_port = cfg->server_port;
     m->psk = cfg->psk; m->cipher = cfg->cipher;
+    m->is_peer = cfg->is_peer;         /* peer: may relay OPENJ to a next hop   */
+    m->peer_egress = cfg->egress;      /* reuse route egress for next-hop dials */
+    m->peer_egress_valid = cfg->egress_valid;
     m->rlisten_tcp_fd = -1; m->rlisten_udp_fd = -1;  /* server has no reverse listener */
     /* reverse target: where the server connects on a client-originated OPEN */
     snprintf (m->rtarget_addr, sizeof m->rtarget_addr, "%s",
@@ -1296,6 +1700,32 @@ portmux_add_tunnel_server (Portmux *self,
     return pm_register_tunnel_route (self, cfg, 1);
 }
 
+int
+portmux_add_tunnel_peer (Portmux *self,
+                         const char *listen_addr, int listen_port,
+                         const unsigned char psk[PM_TUNNEL_PSK_LEN],
+                         PmTunnelCipher cipher,
+                         const PortmuxEgress *egress)
+{
+    if (!self || noise_init () != NOISE_ERROR_NONE)
+        return -1;
+    PmTunnelCfg *cfg = alloc_cfg (self);
+    if (!cfg)
+        return -1;
+    cfg->is_server = 1;                /* a peer IS a server (accepts carriers) */
+    cfg->is_peer = 1;                  /* ...that can also relay OPENJ onward    */
+    snprintf (cfg->server_addr, sizeof cfg->server_addr, "%s",
+              listen_addr ? listen_addr : "0.0.0.0");
+    cfg->server_port = listen_port;
+    snprintf (cfg->bridge_addr, sizeof cfg->bridge_addr, "%s", "127.0.0.1");
+    cfg->bridge_port = 0;              /* single-port (peek-demux)               */
+    memcpy (cfg->psk, psk, PM_TUNNEL_PSK_LEN);
+    cfg->cipher = cipher;
+    /* egress applies to the peer's OUTBOUND next-hop dials */
+    if (egress) { cfg->egress = *egress; cfg->egress_valid = 1; }
+    return pm_register_tunnel_route (self, cfg, 1);
+}
+
 /* Set the reverse target on the most-recently-registered tunnel route (the
    server end connects here on a client-originated reverse OPEN). Returns 0 ok. */
 int
@@ -1327,5 +1757,37 @@ portmux_tunnel_set_reverse_proto (Portmux *self, int proto)
     if (!cfg) return -1;
     if (proto < PM_RLP_TCP || proto > PM_RLP_BOTH) return -1;
     cfg->rlisten_proto = proto;
+    return 0;
+}
+
+/* Configure the EDGE originator's jump-list on the most-recently-added tunnel
+   route (a client whose reverse-listener emits OPENJ). @hops[0] must equal the
+   client's carrier destination (server_addr:server_port); the OPENJ forwarded
+   to that first peer carries hops[1..] + target. Returns 0 on success. */
+int
+portmux_tunnel_set_jumps (Portmux *self,
+                          const PmJumpEndpoint *hops, int nhops,
+                          const char *target_addr, int target_port,
+                          int proto)
+{
+    if (!self || self->route_count == 0) return -1;
+    if (nhops < 1 || nhops > PM_MUX_MAX_HOPS) return -1;   /* need >=1 (the carrier peer) */
+    if (!hops || !target_addr || target_port < 1 || target_port > 65535) return -1;
+    if (proto != PM_MUX_PROTO_TCP && proto != PM_MUX_PROTO_UDP) return -1;
+    PortmuxRoute *r = &self->routes[self->route_count - 1];
+    if (r->proto != PORTMUX_PROTO_TUNNEL_CLIENT) return -1;  /* edge is a client */
+    PmTunnelCfg *cfg = (PmTunnelCfg *)r->egress.callback_data;
+    if (!cfg) return -1;
+
+    memset (&cfg->jump, 0, sizeof cfg->jump);
+    cfg->jump.proto = (unsigned char)proto;
+    cfg->jump.nhops = nhops;
+    for (int i = 0; i < nhops; i++) {
+        snprintf (cfg->jump.hops[i].addr, sizeof cfg->jump.hops[i].addr, "%s", hops[i].addr);
+        cfg->jump.hops[i].port = hops[i].port;
+    }
+    snprintf (cfg->jump.target.addr, sizeof cfg->jump.target.addr, "%s", target_addr);
+    cfg->jump.target.port = target_port;
+    cfg->jump_set = 1;
     return 0;
 }

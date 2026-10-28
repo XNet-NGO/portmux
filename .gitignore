@@ -1,9 +1,12 @@
 # Build outputs
 /build/
+/build-arm64/
 /bin/
+/bin-arm64/
 /dist/
 /.buildtmp/
 *-artifacts.tar.gz
+.release-*/
 
 # Editor / OS
 *.o

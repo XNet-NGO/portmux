@@ -95,6 +95,14 @@ test: $(STATIC) $(HTS_LIB)
 	$(CC) $(PM_CFLAGS) $(NOISE_INC) $(NOISE_DEFS) tests/test_tunnel.c $(STATIC) -o $(BUILDDIR)/test_tunnel $(LDFLAGS)
 	@echo "RUN   test_tunnel"
 	@$(BUILDDIR)/test_tunnel
+	@echo "CC    tests/test_jumplist"
+	$(CC) $(PM_CFLAGS) $(NOISE_INC) $(NOISE_DEFS) tests/test_jumplist.c $(STATIC) -o $(BUILDDIR)/test_jumplist $(LDFLAGS)
+	@echo "RUN   test_jumplist"
+	@$(BUILDDIR)/test_jumplist
+	@echo "CC    tests/test_jump"
+	$(CC) $(PM_CFLAGS) $(NOISE_INC) $(NOISE_DEFS) tests/test_jump.c $(STATIC) -o $(BUILDDIR)/test_jump $(LDFLAGS)
+	@echo "RUN   test_jump"
+	@$(BUILDDIR)/test_jump
 
 clean:
 	rm -rf $(BUILDDIR) $(BINDIR)
