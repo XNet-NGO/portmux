@@ -14,3 +14,6 @@
 *.so
 *.swp
 .DS_Store
+/dist-cli/
+/bin-*/
+/build-*/
