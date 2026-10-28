@@ -100,8 +100,17 @@ usage (const char *argv0)
         "  # on the box: accept clients on :7000, expose adb bridge on :5555\n"
         "  %s tunnel-server 0.0.0.0:7000 127.0.0.1:5555 ~/.ssh/xnet-tunnel.psk\n"
         "  # on the phone: dial the box, splice to local adbd:5555\n"
-        "  %s tunnel-client SERVER_IP:7000 127.0.0.1:5555 ~/.ssh/xnet-tunnel.psk\n",
-        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
+        "  %s tunnel-client SERVER_IP:7000 127.0.0.1:5555 ~/.ssh/xnet-tunnel.psk\n"
+        "\n"
+        "multi-hop jump routing (source-routed, hop-by-hop Noise, one PSK):\n"
+        "  %s tunnel-peer LISTEN_ADDR:LISTEN_PORT PSKFILE [CIPHER]\n"
+        "    a relay peer: forwards OPENJ to the next hop, or connects the final\n"
+        "    target when terminal. PM_EGRESS=dev=IFNAME|src=IP pins next-hop dials.\n"
+        "  # edge: accept adb locally (PM_RLISTEN), route via peerB then peerC to target\n"
+        "  PM_RLISTEN=127.0.0.1:5555 PM_JUMPS=peerC:2222 \\\n"
+        "    %s tunnel-client peerB:2222 TARGET_IP:5555 ~/.ssh/xnet-tunnel.psk\n"
+        "    (jump-list = [peerB(carrier), peerC], final target TARGET_IP:5555)\n",
+        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 /* Split "a:b:c:d:e[:f]" honoring a single [..] bracketed v6 literal in fields.
@@ -214,6 +223,40 @@ main (int argc, char **argv)
         return 1;
     }
 
+    /* Tunnel subcommand: tunnel-peer (multi-hop relay). Single-port peek-demux
+     * listener that relays OPENJ to the next hop (or connects the final target
+     * when it is the terminal hop). Shares the chain PSK.
+     *     tunnel-peer LISTEN_ADDR:PORT PSKFILE [CIPHER]
+     * Optional egress for next-hop dials: PM_EGRESS=dev=IFNAME | src=IP. */
+    if (strcmp (argv[first], "tunnel-peer") == 0) {
+        if (argc - first < 3) { usage (argv[0]); return 1; }
+        char a1[256]; snprintf (a1, sizeof a1, "%s", argv[first + 1]);
+        char *c1 = strrchr (a1, ':');
+        if (!c1) { fprintf (stderr, "expected ADDR:PORT\n"); return 1; }
+        *c1 = '\0';
+        const char *addr1 = a1; int port1 = atoi (c1 + 1);
+        const char *pskfile = argv[first + 2];
+        PmTunnelCipher cipher = parse_cipher (argc - first >= 4 ? argv[first + 3] : NULL);
+
+        unsigned char psk[PM_TUNNEL_PSK_LEN];
+        if (load_psk (pskfile, psk) < 0) return 1;
+
+        PortmuxEgress eg = { 0 }; PortmuxEgress *egp = NULL;
+        const char *es = getenv ("PM_EGRESS");
+        if (es && strncmp (es, "dev=", 4) == 0) { eg.kind = PORTMUX_EGRESS_DEVICE; eg.device = es + 4; egp = &eg; }
+        else if (es && strncmp (es, "src=", 4) == 0) { eg.kind = PORTMUX_EGRESS_SOURCE; eg.source_ip = es + 4; egp = &eg; }
+
+        g_pm = portmux_new ();
+        if (!g_pm) { fprintf (stderr, "portmux_new failed\n"); return 1; }
+        int rc = portmux_add_tunnel_peer (g_pm, addr1, port1, psk, cipher, egp);
+        memset (psk, 0, sizeof psk);
+        if (rc < 0) { fprintf (stderr, "tunnel-peer setup failed\n"); portmux_destroy (g_pm); return 1; }
+        signal (SIGINT, on_signal); signal (SIGTERM, on_signal);
+        rc = portmux_run (g_pm);
+        portmux_destroy (g_pm);
+        return rc == 0 ? 0 : 1;
+    }
+
     /* Tunnel subcommands: tunnel-server / tunnel-client. */
     if (strcmp (argv[first], "tunnel-server") == 0 ||
         strcmp (argv[first], "tunnel-client") == 0) {
@@ -301,6 +344,46 @@ main (int argc, char **argv)
             rc = portmux_add_tunnel_client (g_pm, rl_addr, rl_port, addr1, port1,
                                             addr2, port2, psk, cipher, NULL);
             if (rc == 0 && rl_port > 0) portmux_tunnel_set_reverse_proto (g_pm, rl_proto);
+
+            /* EDGE multi-hop jump: PM_JUMPS=peerB:port,peerC:port makes this
+               client the chain entry. Its reverse listener (PM_RLISTEN) accepts
+               local plaintext clients and emits OPENJ. The jump-list is
+               [carrier(SERVER_ADDR:PORT), PM_JUMPS...] and the final target is
+               the TARGET_ADDR:TARGET_PORT positional. Requires PM_RLISTEN. */
+            const char *jumps = getenv ("PM_JUMPS");
+            if (rc == 0 && jumps && *jumps) {
+                if (rl_port <= 0) {
+                    fprintf (stderr, "PM_JUMPS requires PM_RLISTEN=addr:port (the edge's local listener)\n");
+                    portmux_destroy (g_pm); return 1;
+                }
+                PmJumpEndpoint hops[PM_MUX_MAX_HOPS];
+                memset (hops, 0, sizeof hops);
+                int nh = 0;
+                /* hop[0] = the carrier destination (this client's SERVER) */
+                if (strlen (addr1) >= PM_MUX_ADDR_MAX) { fprintf (stderr, "carrier addr too long\n"); portmux_destroy (g_pm); return 1; }
+                snprintf (hops[nh].addr, sizeof hops[nh].addr, "%s", addr1);
+                hops[nh].port = port1; nh++;
+                /* append PM_JUMPS peers */
+                char jb[1024]; snprintf (jb, sizeof jb, "%s", jumps);
+                char *save = NULL, *tok = strtok_r (jb, ",", &save);
+                while (tok && nh < PM_MUX_MAX_HOPS) {
+                    char *cc = strrchr (tok, ':');
+                    if (!cc) { fprintf (stderr, "PM_JUMPS entry needs addr:port: %s\n", tok); portmux_destroy (g_pm); return 1; }
+                    *cc = '\0';
+                    if (strlen (tok) >= PM_MUX_ADDR_MAX) { fprintf (stderr, "PM_JUMPS addr too long: %s\n", tok); portmux_destroy (g_pm); return 1; }
+                    snprintf (hops[nh].addr, sizeof hops[nh].addr, "%s", tok);
+                    hops[nh].port = atoi (cc + 1); nh++;
+                    tok = strtok_r (NULL, ",", &save);
+                }
+                if (tok) { fprintf (stderr, "PM_JUMPS: too many hops (max %d)\n", PM_MUX_MAX_HOPS); portmux_destroy (g_pm); return 1; }
+                /* final target = the TARGET positional (addr2:port2) */
+                if (!addr2 || port2 <= 0) { fprintf (stderr, "PM_JUMPS needs a TARGET_ADDR:TARGET_PORT positional\n"); portmux_destroy (g_pm); return 1; }
+                if (portmux_tunnel_set_jumps (g_pm, hops, nh, addr2, port2, PM_MUX_PROTO_TCP) < 0) {
+                    fprintf (stderr, "set_jumps failed\n"); portmux_destroy (g_pm); return 1;
+                }
+                fprintf (stderr, "edge jump: %d hop(s) -> target %s:%d (local listener %s:%d)\n",
+                         nh, addr2, port2, rl_addr ? rl_addr : "127.0.0.1", rl_port);
+            }
         }
         /* wipe the local PSK copy from this stack frame */
         memset (psk, 0, sizeof psk);
