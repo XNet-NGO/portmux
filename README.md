@@ -9,6 +9,48 @@ lwIP**: it moves bytes between real kernel sockets. It also includes an optional
 tunnel** (Noise `NoisePSK_NN`, IP + pre-shared key) — both reuse the same
 socket-level relay and egress machinery, still with no lwIP and no TUN.
 
+## Install
+
+One-liner (Linux — detects your architecture, verifies the SHA-256, installs
+the `portmux` CLI to `/usr/local/bin`, falling back to `~/.local/bin`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/XNet-NGO/portmux/master/install.sh | sh
+```
+
+Pin a version or a target, or choose the install dir:
+
+```sh
+PORTMUX_VERSION=v0.5.0 curl -fsSL https://raw.githubusercontent.com/XNet-NGO/portmux/master/install.sh | sh
+PORTMUX_TARGET=linux-x86_64-musl PORTMUX_PREFIX=$HOME/.local/bin \
+  curl -fsSL https://raw.githubusercontent.com/XNet-NGO/portmux/master/install.sh | sh
+```
+
+Prefer to fetch the binary yourself? Each release publishes a per-target CLI
+tarball plus `portmux-<ver>-cli-SHA256SUMS.txt`:
+
+| Platform                | Asset                                   | Notes                                   |
+| ----------------------- | --------------------------------------- | --------------------------------------- |
+| Linux x86_64 (static)   | `portmux-<ver>-linux-x86_64-musl.tar.gz`| musl, fully static — runs on any Linux  |
+| Linux x86_64 (glibc)    | `portmux-<ver>-linux-x86_64.tar.gz`     | dynamic; needs host-or-newer glibc      |
+| Linux aarch64 / arm64   | `portmux-<ver>-linux-aarch64.tar.gz`    | glibc                                   |
+| Linux armv7 (hard-float)| `portmux-<ver>-linux-armv7.tar.gz`      | glibc                                   |
+| Linux riscv64           | `portmux-<ver>-linux-riscv64.tar.gz`    | glibc                                   |
+
+```sh
+# manual, e.g. arm64:
+ver=v0.5.0; t=linux-aarch64
+curl -fsSLO https://github.com/XNet-NGO/portmux/releases/download/$ver/portmux-$ver-$t.tar.gz
+curl -fsSLO https://github.com/XNet-NGO/portmux/releases/download/$ver/portmux-$ver-cli-SHA256SUMS.txt
+sha256sum -c --ignore-missing portmux-$ver-cli-SHA256SUMS.txt
+tar -xzf portmux-$ver-$t.tar.gz portmux && sudo install -m0755 portmux /usr/local/bin/
+```
+
+portmux is **Linux-only** (epoll + an ELF coroutine context switch; no Windows/
+macOS). On an unsupported architecture, [build from source](#build). The x86_64
+one-liner installs the static musl build by default so it does not couple to the
+host glibc version.
+
 ## Why not lwIP?
 
 lwIP earns its place only when the input is raw IP packets from a TUN fd (that is
