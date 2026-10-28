@@ -1,13 +1,30 @@
 # portmux
 
-Userspace TCP/UDP port forwarder for same-device loopback and cross-interface
-relays. No TUN device, no VPN permission, no root required for the loopback and
-source-bind cases. Built on the [hev-task-system](https://github.com/heiher/hev-task-system)
-coroutine runtime — the same scheduler used by hev-socks5-tunnel — but with **no
-lwIP**: it moves bytes between real kernel sockets. It also includes an optional
-**SOCKS5 proxy** inbound (CONNECT + UDP ASSOCIATE) and an optional **encrypted
-tunnel** (Noise `NoisePSK_NN`, IP + pre-shared key) — both reuse the same
-socket-level relay and egress machinery, still with no lwIP and no TUN.
+**One small, static binary that moves bytes between sockets — a port forwarder,
+a SOCKS5 proxy, and an encrypted multi-hop tunnel — with no TUN device, no VPN
+permission, and no root.**
+
+portmux is a userspace TCP/UDP relay built on the
+[hev-task-system](https://github.com/heiher/hev-task-system) coroutine runtime
+(the scheduler behind hev-socks5-tunnel) — but with **no lwIP**: it splices real
+kernel sockets instead of running a userspace IP stack. The result is tiny
+(~300 KB), dependency-free (a fully static musl build runs on any Linux), and
+fast, while doing three jobs the hard tools usually need root or a TUN for:
+
+- **Forward** — `tcp:`/`udp:` map `A → B` on loopback or across interfaces, with
+  optional per-route **egress pinning** (`dev=` / `src=`, and on Android a
+  no-root pin to a chosen network).
+- **SOCKS5 proxy** — inbound `CONNECT` + `UDP ASSOCIATE`, destination chosen per
+  connection, every upstream egress-pinned. A SOCKS proxy "over cellular" with
+  no root, no TUN.
+- **Encrypted tunnel** — a Noise `NoisePSK_NN` carrier (IP + pre-shared key, no
+  certs/PKI) that a CGNAT'd device dials **outbound**; many flows are muxed over
+  one connection, and **multi-hop jump routing** source-routes a stream across
+  relay peers, each hop its own hop-by-hop-encrypted carrier (`ssh -J`, but
+  userspace and TUN-free).
+
+No TUN, no `VpnService`, no root for the loopback/source-bind/tunnel-client
+cases. Linux only (it uses epoll and an ELF coroutine context switch).
 
 ## Install
 
@@ -128,6 +145,22 @@ portmux udp:127.0.0.1:9000:127.0.0.1:9001:dev=wlan0
 # SOCKS5 proxy on :1080, every upstream connection pinned to wlan0
 portmux socks:127.0.0.1:1080:dev=wlan0
 ```
+
+### Help, version, and completions
+
+```sh
+portmux --help          # short usage
+portmux --help-all      # full reference: subcommands, env vars, ciphers, PSK, exit codes
+portmux --version       # e.g. "portmux v0.5.0"
+
+# shell completions (bash / zsh / fish)
+portmux completion bash | sudo tee /etc/bash_completion.d/portmux >/dev/null
+portmux completion zsh  > "${fpath[1]}/_portmux"
+portmux completion fish > ~/.config/fish/completions/portmux.fish
+```
+
+The `install.sh` one-liner installs completions automatically when a writable
+completion directory exists (opt out with `PORTMUX_NO_COMPLETIONS=1`).
 
 ## SOCKS5 proxy
 

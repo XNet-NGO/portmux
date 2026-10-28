@@ -15,11 +15,16 @@ HTS      = $(TPDIR)/hev-task-system
 # NOISE_DEFS/NOISE_SRCS.
 include $(TPDIR)/noise-c/noise-c.mk
 
+# Version string for the CLI (--version). Derived from the git tag; override
+# with `make PORTMUX_VERSION=vX.Y.Z` for out-of-tree/source-tarball builds.
+PORTMUX_VERSION ?= $(shell git -C $(CURDIR) describe --tags --always --dirty 2>/dev/null || echo dev)
+
 # Internal flags are kept separate from the user-facing CFLAGS so that a
 # command-line `make CFLAGS=...` augments rather than clobbers our includes.
 # Pass extra flags via CFLAGS or EXTRA_CFLAGS (e.g. CFLAGS=-fPIC).
 PM_CFLAGS = -O3 -pipe -Wall -Wextra -std=gnu11 \
             -I$(INCDIR) -I$(SRCDIR) -I$(HTS)/include \
+            -DPORTMUX_VERSION='"$(PORTMUX_VERSION)"' \
             $(CFLAGS) $(EXTRA_CFLAGS)
 LDFLAGS += -L$(HTS)/bin -lhev-task-system -lpthread
 
@@ -77,7 +82,7 @@ $(BUILDDIR):
 $(BINDIR):
 	@mkdir -p $(BINDIR)
 
-test: $(STATIC) $(HTS_LIB)
+test: $(STATIC) $(HTS_LIB) $(CLI)
 	@echo "CC    tests/test_relay"
 	$(CC) $(PM_CFLAGS) tests/test_relay.c $(STATIC) -o $(BUILDDIR)/test_relay $(LDFLAGS)
 	@echo "RUN   test_relay"
@@ -103,6 +108,10 @@ test: $(STATIC) $(HTS_LIB)
 	$(CC) $(PM_CFLAGS) $(NOISE_INC) $(NOISE_DEFS) tests/test_jump.c $(STATIC) -o $(BUILDDIR)/test_jump $(LDFLAGS)
 	@echo "RUN   test_jump"
 	@$(BUILDDIR)/test_jump
+	@echo "CC    tests/test_cli"
+	$(CC) $(PM_CFLAGS) tests/test_cli.c -o $(BUILDDIR)/test_cli
+	@echo "RUN   test_cli (execs bin/portmux)"
+	@$(BUILDDIR)/test_cli
 
 clean:
 	rm -rf $(BUILDDIR) $(BINDIR)
