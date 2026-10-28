@@ -739,11 +739,13 @@ mux_dispatch (MuxCtx *m, unsigned char type, unsigned int id,
         }
         PmJumpList rest; PmJumpEndpoint next;
         if (pm_jumplist_pop (&jl, &rest, &next) < 0) { mux_queue_out (m, PM_MUX_CLOSE, id, NULL, 0); return; }
-        /* loop/self guard: refuse to dial our own listen endpoint */
-        if (next.port == m->accept_port) {
-            PM_LOG_W ("tunnel: OPENJ next-hop == self :%d; refusing (stream 0x%04x)", next.port, id);
-            mux_queue_out (m, PM_MUX_CLOSE, id, NULL, 0); return;
-        }
+        /* Loop protection is the PM_MUX_MAX_HOPS cap (bounded above): each relay
+           pops one hop, so a chain can traverse at most MAX_HOPS peers and
+           cannot loop forever. We intentionally do NOT reject a next-hop by
+           port alone — a relay peer legitimately forwards to a DIFFERENT host
+           on the SAME port (e.g. prod:2301 -> runner:2301), which a port-only
+           self-check falsely flags. (A precise same-host+port self check would
+           need the peer to know its own routable address, which it may not.) */
         int sp[2];
         if (socketpair (AF_UNIX, SOCK_STREAM, 0, sp) < 0) { mux_queue_out (m, PM_MUX_CLOSE, id, NULL, 0); return; }
         /* sp[0] = this inbound stream's local fd (spliced carrier<->sp[0] by the
