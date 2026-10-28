@@ -60,7 +60,23 @@ typedef struct
     int listen_fd;                       /* server: encrypted-side listener;
                                             client: unused (-1) */
     int bridge_fd;                       /* server: bridge listener (-1 client) */
+    /* REVERSE path (ssh -R style), optional:
+       client: open a local listener; each accept becomes a client-originated
+               reverse stream dialed to the server's reverse target.
+       server: the reverse target to connect to on a client-originated OPEN. */
+    char rlisten_addr[128];              /* client: reverse listen addr */
+    int rlisten_port;                    /* client: reverse listen port (0=off) */
+    int rlisten_proto;                   /* client: 0=tcp,1=udp,2=both (PM_RLP_*) */
+    int rlisten_tcp_fd;                  /* client: reverse TCP listener fd (-1) */
+    int rlisten_udp_fd;                  /* client: reverse UDP listener fd (-1) */
+    char rtarget_addr[128];              /* server: reverse target addr */
+    int rtarget_port;                    /* server: reverse target port (0=off) */
 } PmTunnelCfg;
+
+/* reverse-listener proto set */
+#define PM_RLP_TCP  0
+#define PM_RLP_UDP  1
+#define PM_RLP_BOTH 2
 
 static const char *
 cipher_name (PmTunnelCipher c)
@@ -287,6 +303,11 @@ typedef struct
     unsigned char *pend;
     size_t pend_len, pend_sent;
     int want_close;              /* peer sent CLOSE; drain pend then close  */
+    int is_udp;                  /* 1 if this stream's local socket is UDP  */
+    /* reverse UDP flow: the client-side listener maps a datagram source to
+       this stream and sendto()s replies back to it. Unused for TCP. */
+    struct sockaddr_storage src; socklen_t srclen;
+    int rlisten_fd;              /* reverse-UDP flow: listener fd for sendto */
 } MuxStream;
 
 typedef struct
@@ -297,7 +318,9 @@ typedef struct
     NoiseCipherState *rx;        /* decrypts our inbound  */
     volatile int alive;          /* 0 once the carrier is torn down */
 
-    MuxStream streams[PM_MUX_MAX_STREAMS];
+    /* Stream tables, split by origin bit: [0] = server-originated (forward),
+       [1] = client-originated (reverse). Index within each by (id & MASK). */
+    MuxStream streams[2][PM_MUX_MAX_STREAMS];
 
     /* inbound carrier frame reassembly */
     unsigned char *inbuf;        /* PM_TUNNEL_MAX_NOISE_MSG */
@@ -314,19 +337,40 @@ typedef struct
     size_t out_head, out_tail;   /* byte offsets; empty when head==tail */
     unsigned char *framebuf;     /* 2+PM_TUNNEL_MAX_NOISE_MSG scratch (heap) */
 
-    /* client only: how to reach the local target for a new OPEN */
+    /* FORWARD target — where the CLIENT connects on a server-originated OPEN
+       (e.g. adbd 127.0.0.1:5555). Client-only. */
     char target_addr[128];
     int target_port;
     int is_server;
-    unsigned int next_id;        /* server: id allocator */
+    unsigned int next_id;        /* server: forward id allocator (origin clear) */
+    unsigned int next_rid;       /* client: reverse id allocator (origin set)   */
     int pend_in;                 /* # streams with a pending inbound buffer */
     int accept_fd;               /* server: single public listener (-1 client) */
     int accept_port;             /* server: the public port (for logging) */
+
+    /* REVERSE path:
+       - client: optional local reverse listener; on accept the client
+         originates a reverse stream. rlisten_fd < 0 if unconfigured.
+       - server: where it connects on a client-originated OPEN (reverse target).
+    */
+    int rlisten_tcp_fd;          /* client: reverse TCP listener fd (-1 none) */
+    int rlisten_udp_fd;          /* client: reverse UDP listener fd (-1 none) */
+    int rlisten_port;            /* client: reverse listen port (0 = none)  */
+    char rtarget_addr[128];      /* server: reverse target address          */
+    int rtarget_port;            /* server: reverse target port (0 = none)  */
+
     /* server: credentials to run the carrier handshake inline when a Noise
        connection is peeked on the shared listener. */
     const unsigned char *psk;    /* PM_TUNNEL_PSK_LEN bytes */
     PmTunnelCipher cipher;
 } MuxCtx;
+
+/* Resolve a 16-bit stream id to its MuxStream slot (origin bit -> table half). */
+static MuxStream *
+mux_slot (MuxCtx *m, unsigned int id)
+{
+    return &m->streams[(id & PM_MUX_ORIGIN) ? 1 : 0][id & PM_MUX_ID_MASK];
+}
 
 #define PM_MUX_OUT_RING (1024 * 1024)   /* 1 MiB carrier output queue */
 
@@ -409,12 +453,11 @@ outring_has_room (MuxCtx *m)
 {
     return outring_free (m) >= (size_t)(2 + PM_TUNNEL_MAX_NOISE_MSG);
 }
-
 /* Drain a stream's pending inbound (carrier->local) bytes to its socket. */
 static int
-mux_flush_stream (MuxCtx *m, int id)
+mux_flush_stream (MuxCtx *m, unsigned int id)
 {
-    MuxStream *st = &m->streams[id];
+    MuxStream *st = mux_slot (m, id);
     if (!st->pend || st->pend_len <= st->pend_sent) return 2;
     ssize_t s = send (st->fd, st->pend + st->pend_sent,
                       st->pend_len - st->pend_sent, MSG_DONTWAIT);
@@ -432,55 +475,104 @@ mux_flush_stream (MuxCtx *m, int id)
 
 /* Close + free a stream slot and detach its fd from the reactor. */
 static void
-mux_close_stream (MuxCtx *m, int id)
+mux_close_stream (MuxCtx *m, unsigned int id)
 {
-    MuxStream *st = &m->streams[id];
+    MuxStream *st = mux_slot (m, id);
     if (st->fd >= 0) { hev_task_del_fd (hev_task_self (), st->fd); close (st->fd); st->fd = -1; }
     if (st->pend) { free (st->pend); st->pend = NULL; m->pend_in--; }
     st->pend_len = st->pend_sent = 0; st->want_close = 0;
 }
 
-/* Open a local target connection for a new OPEN (client side). Returns fd>=0. */
-static int
-mux_connect_target (MuxCtx *m)
+/* Close every live stream in both direction tables. */
+static void
+mux_close_all_streams (MuxCtx *m)
 {
+    for (int dir = 0; dir < 2; dir++) {
+        unsigned int base = dir ? PM_MUX_ORIGIN : 0u;
+        for (unsigned int slot = 1; slot < PM_MUX_MAX_STREAMS; slot++)
+            if (m->streams[dir][slot].fd >= 0)
+                mux_close_stream (m, base | slot);
+    }
+}
+
+/* Connect a local target for a received OPEN. proto = PM_MUX_PROTO_{TCP,UDP}.
+   For UDP we create a connected SOCK_DGRAM socket so recv/send carry single
+   datagrams to/from the target. Returns fd>=0 or -1. */
+static int
+mux_connect_to (MuxCtx *m, const char *addr, int port, int proto)
+{
+    int st = (proto == PM_MUX_PROTO_UDP) ? SOCK_DGRAM : SOCK_STREAM;
     struct sockaddr_storage ss; socklen_t sl;
-    int fam = portmux_resolve (m->target_addr, m->target_port, SOCK_STREAM, 0, &ss, &sl);
+    int fam = portmux_resolve (addr, port, st, 0, &ss, &sl);
     if (fam < 0) return -1;
-    int fd = hev_task_io_socket_socket (fam, SOCK_STREAM, 0);
+    int fd = hev_task_io_socket_socket (fam, st, 0);
     if (fd < 0) return -1;
     hev_task_add_fd (hev_task_self (), fd, POLLIN | POLLOUT);
-    if (hev_task_io_socket_connect (fd, (struct sockaddr *)&ss, sl,
-                                    pm_run_yielder, m->self) < 0) {
-        hev_task_del_fd (hev_task_self (), fd); close (fd); return -1;
+    if (proto == PM_MUX_PROTO_UDP) {
+        /* connect() a datagram socket: fixes the peer so recv()/send() work
+           and the kernel delivers only datagrams from that target. */
+        if (connect (fd, (struct sockaddr *)&ss, sl) < 0 && errno != EINPROGRESS) {
+            hev_task_del_fd (hev_task_self (), fd); close (fd); return -1;
+        }
+    } else {
+        if (hev_task_io_socket_connect (fd, (struct sockaddr *)&ss, sl,
+                                        pm_run_yielder, m->self) < 0) {
+            hev_task_del_fd (hev_task_self (), fd); close (fd); return -1;
+        }
+        pm_set_nodelay (fd);
     }
-    pm_set_nodelay (fd);
-    /* switch interest to read for the relay loop */
-    hev_task_mod_fd (hev_task_self (), fd, POLLIN);
+    hev_task_mod_fd (hev_task_self (), fd, POLLIN);   /* read side for relay */
     return fd;
 }
 
-/* Dispatch one fully-received inbound carrier record. */
+/* Dispatch one fully-received inbound carrier record. OPEN is bidirectional:
+ * a FORWARD OPEN (origin bit clear) is handled by the CLIENT (connect to its
+ * forward target); a REVERSE OPEN (origin bit set) is handled by the SERVER
+ * (connect to its reverse target). DATA/CLOSE route by full id via mux_slot. */
 static void
 mux_dispatch (MuxCtx *m, unsigned char type, unsigned int id,
               unsigned char *pl, size_t pn)
 {
-    if (id >= PM_MUX_MAX_STREAMS) return;
-    MuxStream *st = &m->streams[id];
+    if ((id & PM_MUX_ID_MASK) == 0) return;       /* ids 0 / 0x8000 reserved */
+    MuxStream *st = mux_slot (m, id);
+    int reverse = (id & PM_MUX_ORIGIN) != 0;
 
     if (type == PM_MUX_OPEN) {
-        if (m->is_server) return;                 /* only client opens targets */
-        PM_LOG_I ("tunnel-client: OPEN stream %u -> connecting %s:%d",
-                  id, m->target_addr, m->target_port);
-        int fd = mux_connect_target (m);
-        if (fd < 0) { PM_LOG_W ("tunnel-client: target connect failed (stream %u)", id); mux_queue_out (m, PM_MUX_CLOSE, id, NULL, 0); return; }
+        /* The end that did NOT originate this stream connects to its target. */
+        const char *addr; int port;
+        if (!reverse && !m->is_server) {          /* forward OPEN -> client */
+            addr = m->target_addr; port = m->target_port;
+        } else if (reverse && m->is_server) {     /* reverse OPEN -> server */
+            if (m->rtarget_port <= 0) { mux_queue_out (m, PM_MUX_CLOSE, id, NULL, 0); return; }
+            addr = m->rtarget_addr; port = m->rtarget_port;
+        } else {
+            return;                               /* OPEN we shouldn't receive */
+        }
+        int proto = (pn >= 1) ? pl[0] : PM_MUX_PROTO_TCP;   /* payload[0]=proto */
+        PM_LOG_I ("tunnel: OPEN stream 0x%04x (%s %s) -> connecting %s:%d",
+                  id, reverse ? "reverse" : "forward",
+                  proto == PM_MUX_PROTO_UDP ? "udp" : "tcp", addr, port);
+        int fd = mux_connect_to (m, addr, port, proto);
+        if (fd < 0) { PM_LOG_W ("tunnel: target connect failed (stream 0x%04x)", id); mux_queue_out (m, PM_MUX_CLOSE, id, NULL, 0); return; }
         mux_close_stream (m, id);                 /* clear any stale slot */
         st->fd = fd;
-        PM_LOG_I ("tunnel-client: stream %u target connected fd=%d", id, fd);
+        st->is_udp = (proto == PM_MUX_PROTO_UDP);
+        PM_LOG_I ("tunnel: stream 0x%04x target connected fd=%d", id, fd);
     } else if (type == PM_MUX_DATA) {
-        if (st->fd < 0 || pn == 0) return;
-        /* try immediate write; stash remainder as pending (gated so there is
-           never more than one pending inbound buffer per stream — see pend_in) */
+        if (pn == 0) return;
+        /* UDP reverse flow (client side): no own fd; deliver the datagram back
+           to the original source via the shared reverse listener. */
+        if (st->fd < 0 && st->is_udp && st->srclen) {
+            sendto (st->rlisten_fd, pl, pn, MSG_DONTWAIT,
+                    (struct sockaddr *)&st->src, st->srclen);
+            return;
+        }
+        if (st->fd < 0) return;
+        if (st->is_udp) {
+            /* connected UDP socket: one record == one datagram, no partials */
+            send (st->fd, pl, pn, MSG_DONTWAIT);
+            return;
+        }
         ssize_t s = send (st->fd, pl, pn, MSG_DONTWAIT);
         size_t off = (s > 0) ? (size_t)s : 0;
         if (s < 0 && errno != EAGAIN && errno != EWOULDBLOCK) { mux_close_stream (m, id); mux_queue_out (m, PM_MUX_CLOSE, id, NULL, 0); return; }
@@ -495,10 +587,86 @@ mux_dispatch (MuxCtx *m, unsigned char type, unsigned int id,
         if (st->fd >= 0) st->want_close = 1;      /* drain pend, then close */
     }
 }
-
 /* The unified mux loop: one task, owns carrier + all stream fds. */
 static int mux_server_open (MuxCtx *m, int fd);   /* fwd */
 static int peek_is_carrier (Portmux *self, int fd); /* fwd */
+
+/* Allocate a free reverse (client-origin) slot, or 0 if the table is full.
+   @want_udp_free requires the slot to not be a live UDP flow. */
+static unsigned int
+mux_alloc_rslot (MuxCtx *m)
+{
+    for (unsigned int k = 0; k < PM_MUX_MAX_STREAMS; k++) {
+        unsigned int c = (m->next_rid + k) % PM_MUX_MAX_STREAMS;
+        if (c == 0) continue;
+        MuxStream *s = &m->streams[1][c];
+        if (s->fd < 0 && !s->is_udp) { m->next_rid = (c + 1) % PM_MUX_MAX_STREAMS; return c; }
+    }
+    return 0;
+}
+
+/* Reverse TCP listener: accept connections as new reverse streams. */
+static int
+mux_reverse_accept_tcp (MuxCtx *m, int lfd)
+{
+    int progress = 0;
+    for (int b = 0; b < 4 && outring_has_room (m); b++) {
+        struct sockaddr_storage rp; socklen_t rl = sizeof rp;
+        int rfd = accept (lfd, (struct sockaddr *)&rp, &rl);
+        if (rfd < 0) break;
+        unsigned int slot = mux_alloc_rslot (m);
+        if (slot == 0) { close (rfd); continue; }
+        unsigned int id = PM_MUX_ORIGIN | slot;
+        pm_set_nodelay (rfd);
+        hev_task_add_fd (hev_task_self (), rfd, POLLIN);
+        m->streams[1][slot].fd = rfd;
+        m->streams[1][slot].is_udp = 0;
+        unsigned char proto = PM_MUX_PROTO_TCP;
+        if (mux_queue_out (m, PM_MUX_OPEN, id, &proto, 1) < 0) mux_close_stream (m, id);
+        else PM_LOG_I ("tunnel-client: reverse TCP client -> stream 0x%04x (OPEN)", id);
+        progress = 1;
+    }
+    return progress;
+}
+
+/* Reverse UDP listener: recvfrom datagrams, demux by source into per-flow
+   reverse streams (fd=-1, uses lfd+src). @rbuf is scratch of >= MAX_PLAINTEXT. */
+static int
+mux_reverse_recv_udp (MuxCtx *m, int lfd, unsigned char *rbuf)
+{
+    int progress = 0;
+    for (int b = 0; b < 8 && outring_has_room (m); b++) {
+        struct sockaddr_storage sp; socklen_t spl = sizeof sp;
+        ssize_t n = recvfrom (lfd, rbuf, PM_TUNNEL_MAX_PLAINTEXT - PM_MUX_HDR,
+                              MSG_DONTWAIT, (struct sockaddr *)&sp, &spl);
+        if (n < 0) break;
+        unsigned int id = 0;
+        for (unsigned int s = 1; s < PM_MUX_MAX_STREAMS; s++) {
+            MuxStream *fs = &m->streams[1][s];
+            if (fs->is_udp && fs->fd < 0 && fs->srclen == spl &&
+                memcmp (&fs->src, &sp, spl) == 0) { id = PM_MUX_ORIGIN | s; break; }
+        }
+        if (id == 0) {
+            unsigned int slot = mux_alloc_rslot (m);
+            if (slot == 0) continue;               /* table full: drop */
+            id = PM_MUX_ORIGIN | slot;
+            MuxStream *fs = &m->streams[1][slot];
+            fs->is_udp = 1; fs->fd = -1;
+            memcpy (&fs->src, &sp, spl); fs->srclen = spl;
+            unsigned char proto = PM_MUX_PROTO_UDP;
+            if (mux_queue_out (m, PM_MUX_OPEN, id, &proto, 1) < 0) {
+                fs->is_udp = 0; fs->srclen = 0; continue;
+            }
+            fs->rlisten_fd = lfd;                  /* remember which UDP listener */
+            PM_LOG_I ("tunnel-client: reverse UDP flow -> stream 0x%04x (OPEN)", id);
+        }
+        if (!outring_has_room (m)) break;
+        mux_queue_out (m, PM_MUX_DATA, id, rbuf, (size_t)n);
+        progress = 1;
+    }
+    return progress;
+}
+
 static void
 mux_run (MuxCtx *m)
 {
@@ -513,9 +681,20 @@ mux_run (MuxCtx *m)
         hev_task_add_fd (hev_task_self (), m->carrier_fd, POLLIN | POLLOUT);
     if (m->is_server && m->accept_fd >= 0)
         hev_task_add_fd (hev_task_self (), m->accept_fd, POLLIN);
+    if (!m->is_server && m->rlisten_tcp_fd >= 0)
+        hev_task_add_fd (hev_task_self (), m->rlisten_tcp_fd, POLLIN);
+    if (!m->is_server && m->rlisten_udp_fd >= 0)
+        hev_task_add_fd (hev_task_self (), m->rlisten_udp_fd, POLLIN);
 
     while (m->alive && m->self->run) {
         int progress = 0;
+
+        /* 0b. client: reverse listener(s). Dual-stack: a TCP accept-listener
+               and/or a UDP recvfrom-listener may both be live on the port. */
+        if (!m->is_server && m->carrier_fd >= 0 && outring_has_room (m)) {
+            if (m->rlisten_tcp_fd >= 0 && mux_reverse_accept_tcp (m, m->rlisten_tcp_fd)) progress = 1;
+            if (m->rlisten_udp_fd >= 0 && mux_reverse_recv_udp (m, m->rlisten_udp_fd, rbuf)) progress = 1;
+        }
 
         /* 0. server: accept connections on the SINGLE public listener and
               classify each by peeking (carrier 0x0030 vs adb/data client). */
@@ -545,8 +724,7 @@ mux_run (MuxCtx *m)
                         close (m->carrier_fd);
                         if (m->tx) noise_cipherstate_free (m->tx);
                         if (m->rx) noise_cipherstate_free (m->rx);
-                        for (int id = 0; id < PM_MUX_MAX_STREAMS; id++)
-                            if (m->streams[id].fd >= 0) mux_close_stream (m, id);
+                        mux_close_all_streams (m);
                         m->out_head = m->out_tail = 0;
                         m->ihdr_got = 0; m->have_ilen = 0;
                     }
@@ -625,9 +803,13 @@ mux_run (MuxCtx *m)
         }
     read_done:
 
-        /* 3. per-stream: flush pending local writes, then read local->carrier */
-        for (int id = 0; id < PM_MUX_MAX_STREAMS; id++) {
-            MuxStream *st = &m->streams[id];
+        /* 3. per-stream: flush pending local writes, then read local->carrier.
+              Iterate BOTH direction tables (forward + reverse) by full id. */
+        for (int dir = 0; dir < 2; dir++) {
+          unsigned int base = dir ? PM_MUX_ORIGIN : 0u;
+          for (unsigned int slot = 1; slot < PM_MUX_MAX_STREAMS; slot++) {
+            unsigned int id = base | slot;
+            MuxStream *st = &m->streams[dir][slot];
             if (st->fd < 0) continue;
 
             int fs = mux_flush_stream (m, id);
@@ -643,16 +825,19 @@ mux_run (MuxCtx *m)
 
             ssize_t r = recv (st->fd, rbuf, PM_TUNNEL_MAX_PLAINTEXT - PM_MUX_HDR, MSG_DONTWAIT);
             if (r > 0) {
-                int q = mux_queue_out (m, PM_MUX_DATA, (unsigned int)id, rbuf, (size_t)r);
+                int q = mux_queue_out (m, PM_MUX_DATA, id, rbuf, (size_t)r);
                 if (q < 0) { mux_close_stream (m, id); }
                 progress = 1;
-            } else if (r == 0) {
+            } else if (r == 0 && !st->is_udp) {
+                /* TCP EOF -> close. For UDP, recv==0 is an empty datagram
+                   (no connection semantics); just ignore it. */
                 mux_close_stream (m, id);
-                mux_queue_out (m, PM_MUX_CLOSE, (unsigned int)id, NULL, 0);
-            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                mux_queue_out (m, PM_MUX_CLOSE, id, NULL, 0);
+            } else if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && !st->is_udp) {
                 mux_close_stream (m, id);
-                mux_queue_out (m, PM_MUX_CLOSE, (unsigned int)id, NULL, 0);
+                mux_queue_out (m, PM_MUX_CLOSE, id, NULL, 0);
             }
+          }
         }
 
         if (!progress)
@@ -672,8 +857,7 @@ mux_run (MuxCtx *m)
             close (m->carrier_fd); m->carrier_fd = -1;
             if (m->tx) { noise_cipherstate_free (m->tx); m->tx = NULL; }
             if (m->rx) { noise_cipherstate_free (m->rx); m->rx = NULL; }
-            for (int id = 0; id < PM_MUX_MAX_STREAMS; id++)
-                if (m->streams[id].fd >= 0) mux_close_stream (m, id);
+            mux_close_all_streams (m);
             m->out_head = m->out_tail = 0;
             m->ihdr_got = 0; m->have_ilen = 0;
             continue;                     /* keep serving the listener */
@@ -683,10 +867,13 @@ mux_run (MuxCtx *m)
 
 out:
     m->alive = 0;
-    for (int id = 0; id < PM_MUX_MAX_STREAMS; id++)
-        if (m->streams[id].fd >= 0) mux_close_stream (m, id);
+    mux_close_all_streams (m);
     if (m->is_server && m->accept_fd >= 0)
         hev_task_del_fd (hev_task_self (), m->accept_fd);
+    if (!m->is_server && m->rlisten_tcp_fd >= 0)
+        hev_task_del_fd (hev_task_self (), m->rlisten_tcp_fd);  /* detach; task owns/closes */
+    if (!m->is_server && m->rlisten_udp_fd >= 0)
+        hev_task_del_fd (hev_task_self (), m->rlisten_udp_fd);
     if (m->carrier_fd >= 0)
         hev_task_del_fd (hev_task_self (), m->carrier_fd);
     free (rbuf); free (m->inbuf); free (m->outring); free (m->framebuf);
@@ -697,19 +884,22 @@ out:
 static int
 mux_server_open (MuxCtx *m, int fd)
 {
-    unsigned int id = 0; int found = 0;
+    unsigned int slot = 0;
     for (unsigned int k = 0; k < PM_MUX_MAX_STREAMS; k++) {
         unsigned int cand = (m->next_id + k) % PM_MUX_MAX_STREAMS;
         if (cand == 0) continue;
-        if (m->streams[cand].fd < 0) { id = cand; found = 1; break; }
+        if (m->streams[0][cand].fd < 0) { slot = cand; break; }
     }
-    if (!found) { close (fd); return -1; }
-    m->next_id = (id + 1) % PM_MUX_MAX_STREAMS;
+    if (slot == 0) { close (fd); return -1; }
+    m->next_id = (slot + 1) % PM_MUX_MAX_STREAMS;
+    unsigned int id = slot;                 /* forward: origin bit clear */
     pm_set_nodelay (fd);
     hev_task_add_fd (hev_task_self (), fd, POLLIN);
-    m->streams[id].fd = fd;
-    if (mux_queue_out (m, PM_MUX_OPEN, id, NULL, 0) < 0) { mux_close_stream (m, (int)id); return -1; }
-    PM_LOG_I ("tunnel-server: adb client -> stream %u (OPEN)", id);
+    m->streams[0][slot].fd = fd;
+    m->streams[0][slot].is_udp = 0;
+    unsigned char proto = PM_MUX_PROTO_TCP;   /* forward (adb) is always TCP */
+    if (mux_queue_out (m, PM_MUX_OPEN, id, &proto, 1) < 0) { mux_close_stream (m, id); return -1; }
+    PM_LOG_I ("tunnel-server: adb client -> stream 0x%04x (OPEN)", id);
     return (int)id;
 }
 
@@ -763,6 +953,39 @@ tunnel_client_task (void *data)
 
     pm_task_register (self, &node);
 
+    /* Open the reverse listener(s) ONCE (persist across carrier reconnects).
+       proto = tcp / udp / both -> open a SOCK_STREAM and/or SOCK_DGRAM socket
+       on the same port, both feeding the mux loop. */
+    cfg->rlisten_tcp_fd = -1;
+    cfg->rlisten_udp_fd = -1;
+    if (cfg->rlisten_port > 0) {
+        const char *raddr = cfg->rlisten_addr[0] ? cfg->rlisten_addr : "127.0.0.1";
+        int want_tcp = (cfg->rlisten_proto == PM_RLP_TCP || cfg->rlisten_proto == PM_RLP_BOTH);
+        int want_udp = (cfg->rlisten_proto == PM_RLP_UDP || cfg->rlisten_proto == PM_RLP_BOTH);
+        for (int pass = 0; pass < 2; pass++) {
+            int udp = (pass == 1);
+            if ((udp && !want_udp) || (!udp && !want_tcp)) continue;
+            int stype = udp ? SOCK_DGRAM : SOCK_STREAM;
+            struct sockaddr_storage rss; socklen_t rl; int on = 1;
+            int rfam = portmux_resolve (raddr, cfg->rlisten_port, stype, 1, &rss, &rl);
+            if (rfam < 0) continue;
+            int lfd = hev_task_io_socket_socket (rfam, stype, 0);
+            if (lfd < 0) continue;
+            setsockopt (lfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+            int ok = (bind (lfd, (struct sockaddr *)&rss, rl) == 0)
+                     && (udp || listen (lfd, 16) == 0);
+            if (ok) {
+                if (udp) cfg->rlisten_udp_fd = lfd; else cfg->rlisten_tcp_fd = lfd;
+                PM_LOG_I ("tunnel-client: reverse %s listener on %s:%d",
+                          udp ? "udp" : "tcp", raddr, cfg->rlisten_port);
+            } else {
+                PM_LOG_W ("tunnel-client: reverse %s listen %s:%d failed: %s",
+                          udp ? "udp" : "tcp", raddr, cfg->rlisten_port, strerror (errno));
+                close (lfd);
+            }
+        }
+    }
+
     while (self->run) {
         /* Resolve + dial the rendezvous server (encrypted side). */
         family = portmux_resolve (cfg->server_addr, cfg->server_port,
@@ -800,14 +1023,23 @@ tunnel_client_task (void *data)
            connection to the local target (adbd); the single mux loop owns the
            carrier and all stream fds and runs until the carrier dies. */
         {
-            MuxCtx m;
-            memset (&m, 0, sizeof m);
-            m.self = self; m.carrier_fd = srv_fd; m.tx = tx; m.rx = rx;
-            m.alive = 1; m.is_server = 0; m.accept_fd = -1;
-            for (int i = 0; i < PM_MUX_MAX_STREAMS; i++) m.streams[i].fd = -1;
-            snprintf (m.target_addr, sizeof m.target_addr, "%s", cfg->target_addr);
-            m.target_port = cfg->target_port;
-            mux_run (&m);
+            /* MuxCtx is large (two 256-slot stream tables); heap-allocate so it
+               does not overflow the 64KB hev-task coroutine stack. */
+            MuxCtx *m = calloc (1, sizeof *m);
+            if (!m) goto reconnect;
+            m->self = self; m->carrier_fd = srv_fd; m->tx = tx; m->rx = rx;
+            m->alive = 1; m->is_server = 0; m->accept_fd = -1;
+            m->next_id = 1; m->next_rid = 1;
+            for (int d = 0; d < 2; d++)
+                for (int i = 0; i < PM_MUX_MAX_STREAMS; i++) m->streams[d][i].fd = -1;
+            snprintf (m->target_addr, sizeof m->target_addr, "%s", cfg->target_addr);
+            m->target_port = cfg->target_port;
+            /* reverse listener (ssh -R style): client-local port -> server target */
+            m->rlisten_tcp_fd = cfg->rlisten_tcp_fd;
+            m->rlisten_udp_fd = cfg->rlisten_udp_fd;
+            m->rlisten_port = cfg->rlisten_port;
+            mux_run (m);
+            free (m);
         }
         PM_LOG_I ("tunnel-client: carrier ended; will reconnect");
 
@@ -826,6 +1058,8 @@ reconnect:
         hev_task_sleep (PM_TUNNEL_RECONNECT_DEBOUNCE_MS);
     }
 
+    if (cfg->rlisten_tcp_fd >= 0) { close (cfg->rlisten_tcp_fd); cfg->rlisten_tcp_fd = -1; }
+    if (cfg->rlisten_udp_fd >= 0) { close (cfg->rlisten_udp_fd); cfg->rlisten_udp_fd = -1; }
     pm_task_unregister (self, &node);
 }
 
@@ -865,19 +1099,28 @@ tunnel_server_task (void *data)
     PM_LOG_I ("tunnel-server: single-port %s:%d (carrier + adb, peek-demux)",
               cfg->server_addr, cfg->server_port);
 
-    MuxCtx m;
-    memset (&m, 0, sizeof m);
-    m.self = self;
-    m.carrier_fd = -1;                 /* no carrier until the phone dials in */
-    m.alive = 1; m.is_server = 1; m.next_id = 1;
-    m.accept_fd = cfg->listen_fd;      /* the single public listener           */
-    m.accept_port = cfg->server_port;
-    m.psk = cfg->psk; m.cipher = cfg->cipher;
-    for (int i = 0; i < PM_MUX_MAX_STREAMS; i++) m.streams[i].fd = -1;
+    /* MuxCtx is large (two 256-slot stream tables); heap-allocate so it does
+       not overflow the 64KB hev-task coroutine stack. */
+    MuxCtx *m = calloc (1, sizeof *m);
+    if (!m) { close (cfg->listen_fd); pm_task_unregister (self, &node); return; }
+    m->self = self;
+    m->carrier_fd = -1;                /* no carrier until the phone dials in */
+    m->alive = 1; m->is_server = 1; m->next_id = 1; m->next_rid = 1;
+    m->accept_fd = cfg->listen_fd;     /* the single public listener           */
+    m->accept_port = cfg->server_port;
+    m->psk = cfg->psk; m->cipher = cfg->cipher;
+    m->rlisten_tcp_fd = -1; m->rlisten_udp_fd = -1;  /* server has no reverse listener */
+    /* reverse target: where the server connects on a client-originated OPEN */
+    snprintf (m->rtarget_addr, sizeof m->rtarget_addr, "%s",
+              cfg->rtarget_addr[0] ? cfg->rtarget_addr : "127.0.0.1");
+    m->rtarget_port = cfg->rtarget_port;
+    for (int d = 0; d < 2; d++)
+        for (int i = 0; i < PM_MUX_MAX_STREAMS; i++) m->streams[d][i].fd = -1;
 
     /* Runs until engine shutdown; internally establishes/replaces the carrier
        and muxes adb clients. Never returns until self->run == 0. */
-    mux_run (&m);
+    mux_run (m);
+    free (m);
 
     close (cfg->listen_fd);
     pm_task_unregister (self, &node);
@@ -959,7 +1202,8 @@ static PmTunnelCfg *
 alloc_cfg (Portmux *self)
 {
     PmTunnelCfg *cfg = calloc (1, sizeof *cfg);
-    if (cfg) { cfg->owner = self; cfg->listen_fd = -1; cfg->bridge_fd = -1; }
+    if (cfg) { cfg->owner = self; cfg->listen_fd = -1; cfg->bridge_fd = -1;
+               cfg->rlisten_tcp_fd = -1; cfg->rlisten_udp_fd = -1; }
     return cfg;
 }
 
@@ -1001,7 +1245,7 @@ portmux_add_tunnel_client (Portmux *self,
                            PmTunnelCipher cipher,
                            const PortmuxEgress *egress)
 {
-    (void)listen_addr; (void)listen_port; /* v1 client has no local listener */
+    (void)listen_addr; (void)listen_port;
     if (!self || noise_init () != NOISE_ERROR_NONE)
         return -1;
     PmTunnelCfg *cfg = alloc_cfg (self);
@@ -1013,6 +1257,15 @@ portmux_add_tunnel_client (Portmux *self,
     snprintf (cfg->target_addr, sizeof cfg->target_addr, "%s",
               target_addr ? target_addr : "127.0.0.1");
     cfg->target_port = target_port;
+    /* The client's optional local listener is the REVERSE listener (ssh -R):
+       connections to listen_addr:listen_port become client-originated streams
+       that the server splices to its reverse target. 0 = disabled (forward
+       only, e.g. the re-adb adb path). */
+    if (listen_port > 0) {
+        snprintf (cfg->rlisten_addr, sizeof cfg->rlisten_addr, "%s",
+                  listen_addr ? listen_addr : "127.0.0.1");
+        cfg->rlisten_port = listen_port;
+    }
     memcpy (cfg->psk, psk, PM_TUNNEL_PSK_LEN);
     cfg->cipher = cipher;
     if (egress) { cfg->egress = *egress; cfg->egress_valid = 1; }
@@ -1041,4 +1294,38 @@ portmux_add_tunnel_server (Portmux *self,
     memcpy (cfg->psk, psk, PM_TUNNEL_PSK_LEN);
     cfg->cipher = cipher;
     return pm_register_tunnel_route (self, cfg, 1);
+}
+
+/* Set the reverse target on the most-recently-registered tunnel route (the
+   server end connects here on a client-originated reverse OPEN). Returns 0 ok. */
+int
+portmux_tunnel_set_reverse_target (Portmux *self,
+                                   const char *target_addr, int target_port)
+{
+    if (!self || self->route_count == 0) return -1;
+    PortmuxRoute *r = &self->routes[self->route_count - 1];
+    if (r->proto != PORTMUX_PROTO_TUNNEL_SERVER &&
+        r->proto != PORTMUX_PROTO_TUNNEL_CLIENT)
+        return -1;
+    PmTunnelCfg *cfg = (PmTunnelCfg *)r->egress.callback_data;
+    if (!cfg) return -1;
+    snprintf (cfg->rtarget_addr, sizeof cfg->rtarget_addr, "%s",
+              target_addr ? target_addr : "127.0.0.1");
+    cfg->rtarget_port = target_port;
+    return 0;
+}
+
+/* Set the most-recently-added tunnel route's reverse-listener proto:
+   0=TCP, 1=UDP, 2=BOTH (dual-stack on the same port). Call after
+   add_tunnel_client/server. Returns 0 on success. */
+int
+portmux_tunnel_set_reverse_proto (Portmux *self, int proto)
+{
+    if (!self || self->route_count == 0) return -1;
+    PortmuxRoute *r = &self->routes[self->route_count - 1];
+    PmTunnelCfg *cfg = (PmTunnelCfg *)r->egress.callback_data;
+    if (!cfg) return -1;
+    if (proto < PM_RLP_TCP || proto > PM_RLP_BOTH) return -1;
+    cfg->rlisten_proto = proto;
+    return 0;
 }

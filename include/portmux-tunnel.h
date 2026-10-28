@@ -59,9 +59,12 @@
 
      [ u8 type ][ u16 stream-id (BE) ][ payload ... ]
 
-       type 0x01 OPEN   : server->client, open a new stream; client connects to
-                          its local target (adbd). No payload.
-       type 0x02 DATA   : either direction; payload is the stream's bytes.
+       type 0x01 OPEN   : open a new stream. Payload = 1 byte proto
+                          (0 = TCP, 1 = UDP). The receiver connects/binds a
+                          socket of that proto to its target.
+       type 0x02 DATA   : either direction; payload is the stream's bytes. For
+                          a UDP stream each DATA record is EXACTLY one datagram
+                          (the record framing preserves datagram boundaries).
        type 0x03 CLOSE  : either direction; the stream's socket closed. No payload.
 
  Topology (phone behind CGNAT still dials OUT; the box's public port is now the
@@ -106,7 +109,23 @@ extern "C" {
 #define PM_MUX_DATA   0x02
 #define PM_MUX_CLOSE  0x03
 #define PM_MUX_HDR    3            /* 1B type + 2B stream-id (BE) */
-#define PM_MUX_MAX_STREAMS 256     /* concurrent streams over one carrier */
+#define PM_MUX_MAX_STREAMS 256     /* concurrent streams per direction        */
+
+/* Stream-id origin namespacing (symmetric mux). The 16-bit id's top bit marks
+ * which END originated the stream, so both ends can open streams on one carrier
+ * without id collisions (ssh -L forward AND ssh -R reverse on one pipe):
+ *   - origin bit CLEAR  (0x0001..0x7fff): SERVER-originated = FORWARD path.
+ *     The server accepts a client on its public port, opens the stream, and the
+ *     tunnel CLIENT connects to its local forward target (e.g. adbd 5555).
+ *   - origin bit SET    (0x8001..0xffff): CLIENT-originated = REVERSE path.
+ *     The tunnel CLIENT accepts on a local reverse-listener, opens the stream,
+ *     and the SERVER connects to its configured reverse target.
+ * id 0 and 0x8000 are reserved (never allocated). Each end indexes its stream
+ * table by (id & 0x8000 -> which half) and (id & 0x7fff -> slot). */
+#define PM_MUX_ORIGIN      0x8000u  /* set on client-originated (reverse) ids */
+#define PM_MUX_ID_MASK     0x7fffu  /* slot index within a direction          */
+#define PM_MUX_PROTO_TCP   0        /* OPEN payload[0] */
+#define PM_MUX_PROTO_UDP   1
 
 /* Cipher suite selector for the Noise name. */
 typedef enum
@@ -156,6 +175,32 @@ int portmux_add_tunnel_server (Portmux *self,
                                const char *bridge_addr, int bridge_port,
                                const unsigned char psk[PM_TUNNEL_PSK_LEN],
                                PmTunnelCipher cipher);
+
+/**
+ * portmux_tunnel_set_reverse_target:
+ * Set the REVERSE target on the most-recently-added tunnel route. On a
+ * client-originated reverse stream (ssh -R style), the SERVER end connects to
+ * @target_addr:@target_port and splices. Pair this (on the server) with a
+ * client that was given a local listener via portmux_add_tunnel_client()'s
+ * @listen_addr/@listen_port (which now acts as the reverse listener). Returns 0.
+ *
+ * NOTE: portmux_add_tunnel_client()'s @listen_addr/@listen_port — previously
+ * unused — now configure the client's REVERSE LISTENER: connections there
+ * become client-originated streams the server splices to its reverse target.
+ */
+int portmux_tunnel_set_reverse_target (Portmux *self,
+                                       const char *target_addr, int target_port);
+
+/**
+ * portmux_tunnel_set_reverse_proto:
+ * Set the most-recently-added tunnel route's reverse-listener protocol:
+ *   0 = TCP (default), 1 = UDP, 2 = BOTH (dual-stack: a TCP accept-listener
+ *   AND a UDP recvfrom-listener on the same port, e.g. for DNS/QUIC/iperf3-u
+ *   which needs a TCP control channel + UDP data on one port).
+ * The client's reverse listener binds accordingly; the server opens the
+ * matching socket type per stream from the OPEN proto byte. Returns 0 on ok.
+ */
+int portmux_tunnel_set_reverse_proto (Portmux *self, int proto);
 
 #ifdef __cplusplus
 }
