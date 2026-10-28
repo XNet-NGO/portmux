@@ -13,9 +13,19 @@
 #include "portmux.h"
 #include "portmux-tunnel.h"
 
+#ifndef PORTMUX_VERSION
+#define PORTMUX_VERSION "dev"
+#endif
+
 extern int portmux_log_level;
 
 static Portmux *g_pm;
+
+static void
+print_version (void)
+{
+    printf ("portmux %s\n", PORTMUX_VERSION);
+}
 
 static void
 on_signal (int sig)
@@ -73,10 +83,16 @@ parse_cipher (const char *s)
 
 
 static void
-usage (const char *argv0)
+usage (FILE *out, const char *argv0)
 {
-    fprintf (stderr,
+    fprintf (out,
+        "portmux %s — userspace TCP/UDP forwarder, SOCKS5 proxy, and encrypted\n"
+        "          (NoisePSK_NN) tunnel with multi-hop jump routing. No TUN, no root.\n"
+        "\n"
         "usage: %s [-v] ROUTE [ROUTE ...]\n"
+        "       %s <tunnel-server|tunnel-client|tunnel-peer> ...\n"
+        "       %s completion <bash|zsh|fish>\n"
+        "       %s --help | --help-all | --version\n"
         "\n"
         "ROUTE: PROTO:LADDR:LPORT:TADDR:TPORT[:EGRESS]\n"
         "       socks:LADDR:LPORT[:EGRESS]     (SOCKS5 proxy, dynamic target)\n"
@@ -109,8 +125,142 @@ usage (const char *argv0)
         "  # edge: accept adb locally (PM_RLISTEN), route via peerB then peerC to target\n"
         "  PM_RLISTEN=127.0.0.1:5555 PM_JUMPS=peerC:2222 \\\n"
         "    %s tunnel-client peerB:2222 TARGET_IP:5555 ~/.ssh/xnet-tunnel.psk\n"
-        "    (jump-list = [peerB(carrier), peerC], final target TARGET_IP:5555)\n",
+        "    (jump-list = [peerB(carrier), peerC], final target TARGET_IP:5555)\n"
+        "\n"
+        "Run `%s --help-all` for the full reference (env vars, ciphers, PSK, exit codes).\n",
+        PORTMUX_VERSION,
+        argv0, argv0, argv0, argv0,
         argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
+}
+
+/* Expanded reference: every subcommand, all env vars, ciphers, PSK formats,
+   egress forms, and exit codes. Printed by --help-all. */
+static void
+help_all (FILE *out, const char *argv0)
+{
+    usage (out, argv0);
+    fprintf (out,
+        "\n"
+        "─────────────────────────────── full reference ───────────────────────────────\n"
+        "\n"
+        "SUBCOMMANDS\n"
+        "  (plain routes)         one or more ROUTE/socks args; forward or proxy.\n"
+        "  tunnel-server A:P [BRIDGE] PSKFILE [CIPHER]\n"
+        "                         accept encrypted carriers on A:P. Single-port form\n"
+        "                         (no BRIDGE) = B1 peek-demux: the one port is BOTH the\n"
+        "                         carrier dial-in AND the plaintext endpoint.\n"
+        "  tunnel-client S:P T:P PSKFILE [CIPHER]\n"
+        "                         dial server S:P, splice to local target T:P.\n"
+        "  tunnel-peer  A:P PSKFILE [CIPHER]\n"
+        "                         relay node for multi-hop jumps (single-port).\n"
+        "  completion   bash|zsh|fish      emit a shell completion script to stdout.\n"
+        "\n"
+        "GLOBAL FLAGS\n"
+        "  -v                     verbose logging (info level).\n"
+        "  -h, --help             short usage.\n"
+        "  --help-all             this full reference.\n"
+        "  --version, -V          print version and exit.\n"
+        "\n"
+        "ENVIRONMENT VARIABLES\n"
+        "  PM_RTARGET=ADDR:PORT   tunnel-server: reverse target. On a client-originated\n"
+        "                         reverse stream the server connects here (ssh -R style).\n"
+        "  PM_RLISTEN=[tcp:|udp:|both:]ADDR:PORT\n"
+        "                         tunnel-client: open a local reverse listener. With a\n"
+        "                         proto prefix, bind TCP, UDP, or BOTH on that port.\n"
+        "                         Also the local plaintext entry for a jump edge.\n"
+        "  PM_JUMPS=ADDR:PORT[,ADDR:PORT...]\n"
+        "                         tunnel-client: make this the multi-hop EDGE. The\n"
+        "                         carrier dials SERVER_ADDR:PORT (= first hop); OPENJ\n"
+        "                         carries the remaining hops + the TARGET positional as\n"
+        "                         the final destination. Requires PM_RLISTEN. Max %d hops.\n"
+        "  PM_EGRESS=dev=IFNAME | src=IP\n"
+        "                         tunnel-peer: pin the onward (next-hop) dial's egress.\n"
+        "\n"
+        "CIPHERS (Noise suite NoisePSK_NN_25519_<CIPHER>_BLAKE2s)\n"
+        "  aesgcm   (default)     AES-256-GCM — HW-accelerated on ARMv8 / x86 AES-NI.\n"
+        "  chacha                 ChaCha20-Poly1305 — fast without AES hardware.\n"
+        "  Both ends of a tunnel MUST use the same cipher.\n"
+        "\n"
+        "PSK (pre-shared key, the sole authenticator — IP + key, no certificates)\n"
+        "  PSKFILE holds either 32 raw bytes OR 64 hex chars (an optional 0x prefix and\n"
+        "  trailing newline are tolerated). A mismatched PSK fails the handshake; no\n"
+        "  data flows. Keep it 0600.\n"
+        "\n"
+        "EGRESS (per-route outbound pinning, where supported)\n"
+        "  dev=IFNAME             SO_BINDTODEVICE to an interface (needs CAP_NET_RAW).\n"
+        "  src=IP                 bind the upstream socket to a local source IP.\n"
+        "\n"
+        "EXIT CODES\n"
+        "  0  clean shutdown (SIGINT/SIGTERM) or help/version.\n"
+        "  1  usage error, bad route/PSK, or engine failure.\n"
+        "\n"
+        "Docs & source: https://github.com/XNet-NGO/portmux\n",
+        PM_MUX_MAX_HOPS);
+}
+
+/* Emit a shell completion script for bash|zsh|fish to stdout. */
+static int
+completion (const char *shell)
+{
+    static const char *subs = "tcp udp socks tunnel-server tunnel-client tunnel-peer completion";
+    static const char *flags = "-v -h --help --help-all --version -V";
+    if (strcmp (shell, "bash") == 0) {
+        printf (
+            "# portmux bash completion.  Install:\n"
+            "#   portmux completion bash | sudo tee /etc/bash_completion.d/portmux >/dev/null\n"
+            "_portmux() {\n"
+            "    local cur prev\n"
+            "    cur=\"${COMP_WORDS[COMP_CWORD]}\"\n"
+            "    prev=\"${COMP_WORDS[COMP_CWORD-1]}\"\n"
+            "    if [ \"$prev\" = completion ]; then\n"
+            "        COMPREPLY=( $(compgen -W 'bash zsh fish' -- \"$cur\") ); return\n"
+            "    fi\n"
+            "    case \"$cur\" in\n"
+            "        -*) COMPREPLY=( $(compgen -W '%s' -- \"$cur\") ); return;;\n"
+            "    esac\n"
+            "    if [ \"$COMP_CWORD\" -eq 1 ]; then\n"
+            "        COMPREPLY=( $(compgen -W '%s %s' -- \"$cur\") )\n"
+            "    fi\n"
+            "}\n"
+            "complete -o default -F _portmux portmux\n",
+            flags, subs, flags);
+        return 0;
+    }
+    if (strcmp (shell, "zsh") == 0) {
+        printf (
+            "#compdef portmux\n"
+            "# portmux zsh completion.  Install: put this on your $fpath as _portmux\n"
+            "#   portmux completion zsh > \"${fpath[1]}/_portmux\"\n"
+            "_portmux() {\n"
+            "  local -a subs flags\n"
+            "  subs=(tcp udp socks tunnel-server tunnel-client tunnel-peer completion)\n"
+            "  flags=(-v -h --help --help-all --version -V)\n"
+            "  if (( CURRENT == 2 )); then\n"
+            "    _describe 'command' subs; _describe 'flag' flags\n"
+            "  elif [[ \"${words[CURRENT-1]}\" == completion ]]; then\n"
+            "    compadd bash zsh fish\n"
+            "  fi\n"
+            "}\n"
+            "_portmux \"$@\"\n");
+        return 0;
+    }
+    if (strcmp (shell, "fish") == 0) {
+        printf (
+            "# portmux fish completion.  Install:\n"
+            "#   portmux completion fish > ~/.config/fish/completions/portmux.fish\n"
+            "complete -c portmux -f\n"
+            "for s in tcp udp socks tunnel-server tunnel-client tunnel-peer completion\n"
+            "    complete -c portmux -n '__fish_use_subcommand' -a $s\n"
+            "end\n"
+            "complete -c portmux -s v -d 'verbose logging'\n"
+            "complete -c portmux -s h -l help -d 'short usage'\n"
+            "complete -c portmux -l help-all -d 'full reference'\n"
+            "complete -c portmux -l version -s V -d 'print version'\n"
+            "complete -c portmux -n '__fish_seen_subcommand_from completion' -a 'bash zsh fish'\n");
+        return 0;
+    }
+    fprintf (stderr, "completion: unknown shell '%s' (want bash|zsh|fish)\n", shell);
+    return 1;
 }
 
 /* Split "a:b:c:d:e[:f]" honoring a single [..] bracketed v6 literal in fields.
@@ -208,8 +358,28 @@ main (int argc, char **argv)
 {
     int i, first = 1;
 
+    /* Global flags / meta subcommands handled before route parsing. These may
+       appear as the first arg (argv[1]); --help/--version print to stdout and
+       exit 0. */
+    if (argc >= 2) {
+        const char *a = argv[1];
+        if (strcmp (a, "--help") == 0 || strcmp (a, "-h") == 0) {
+            usage (stdout, argv[0]); return 0;
+        }
+        if (strcmp (a, "--help-all") == 0) {
+            help_all (stdout, argv[0]); return 0;
+        }
+        if (strcmp (a, "--version") == 0 || strcmp (a, "-V") == 0) {
+            print_version (); return 0;
+        }
+        if (strcmp (a, "completion") == 0) {
+            if (argc < 3) { fprintf (stderr, "completion: need a shell (bash|zsh|fish)\n"); return 1; }
+            return completion (argv[2]);
+        }
+    }
+
     if (argc < 2) {
-        usage (argv[0]);
+        usage (stderr, argv[0]);
         return 1;
     }
 
@@ -219,7 +389,7 @@ main (int argc, char **argv)
     }
 
     if (first >= argc) {
-        usage (argv[0]);
+        usage (stderr, argv[0]);
         return 1;
     }
 
@@ -229,7 +399,7 @@ main (int argc, char **argv)
      *     tunnel-peer LISTEN_ADDR:PORT PSKFILE [CIPHER]
      * Optional egress for next-hop dials: PM_EGRESS=dev=IFNAME | src=IP. */
     if (strcmp (argv[first], "tunnel-peer") == 0) {
-        if (argc - first < 3) { usage (argv[0]); return 1; }
+        if (argc - first < 3) { usage (stderr, argv[0]); return 1; }
         char a1[256]; snprintf (a1, sizeof a1, "%s", argv[first + 1]);
         char *c1 = strrchr (a1, ':');
         if (!c1) { fprintf (stderr, "expected ADDR:PORT\n"); return 1; }
@@ -277,7 +447,7 @@ main (int argc, char **argv)
         }
 
         int need = single_port ? 3 : 4;
-        if (argc - first < need) { usage (argv[0]); return 1; }
+        if (argc - first < need) { usage (stderr, argv[0]); return 1; }
 
         char a1[256], a2[256];
         snprintf (a1, sizeof a1, "%s", argv[first + 1]);

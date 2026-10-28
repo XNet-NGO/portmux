@@ -114,10 +114,42 @@ main() {
 
     say "portmux installed: $dest/portmux"
     "$dest/portmux" 2>&1 | head -1 >&2 || true
+
+    # best-effort shell completions (opt out with PORTMUX_NO_COMPLETIONS=1)
+    if [ -z "${PORTMUX_NO_COMPLETIONS:-}" ]; then
+        install_completions "$dest/portmux"
+    fi
+
     case ":$PATH:" in
         *":$dest:"*) : ;;
         *) say "note: $dest is not on your PATH — add it, e.g.  export PATH=\"$dest:\$PATH\"" ;;
     esac
+}
+
+# Drop bash/zsh/fish completions into a writable standard dir, if one exists.
+install_completions() {
+    bin="$1"
+    # bash
+    for d in "$HOME/.local/share/bash-completion/completions" \
+             /usr/share/bash-completion/completions /etc/bash_completion.d; do
+        if mkdir -p "$d" 2>/dev/null && [ -w "$d" ]; then
+            "$bin" completion bash > "$d/portmux" 2>/dev/null && say "  bash completion -> $d/portmux"
+            break
+        fi
+    done
+    # zsh (needs to be on fpath; ~/.zsh/completions is a common choice)
+    for d in "$HOME/.local/share/zsh/site-functions" "$HOME/.zsh/completions" \
+             /usr/share/zsh/site-functions; do
+        if mkdir -p "$d" 2>/dev/null && [ -w "$d" ]; then
+            "$bin" completion zsh > "$d/_portmux" 2>/dev/null && say "  zsh completion  -> $d/_portmux (ensure it is on your fpath)"
+            break
+        fi
+    done
+    # fish
+    d="$HOME/.config/fish/completions"
+    if mkdir -p "$d" 2>/dev/null && [ -w "$d" ]; then
+        "$bin" completion fish > "$d/portmux.fish" 2>/dev/null && say "  fish completion -> $d/portmux.fish"
+    fi
 }
 
 main "$@"
