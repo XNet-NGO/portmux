@@ -269,13 +269,39 @@ main (int argc, char **argv)
         if (!g_pm) { fprintf (stderr, "portmux_new failed\n"); return 1; }
 
         int rc;
-        if (is_server)
+        if (is_server) {
             rc = portmux_add_tunnel_server (g_pm, addr1, port1,
                                             addr2 ? addr2 : "127.0.0.1", port2,
                                             psk, cipher);
-        else
-            rc = portmux_add_tunnel_client (g_pm, NULL, 0, addr1, port1,
+            /* reverse target (server end of an ssh -R style reverse stream):
+               PM_RTARGET=addr:port -> server connects here on a reverse OPEN */
+            const char *rt = getenv ("PM_RTARGET");
+            if (rc == 0 && rt && strrchr (rt, ':')) {
+                char buf[256]; snprintf (buf, sizeof buf, "%s", rt);
+                char *c = strrchr (buf, ':'); *c = '\0';
+                portmux_tunnel_set_reverse_target (g_pm, buf, atoi (c + 1));
+            }
+        } else {
+            /* reverse listener (client end): PM_RLISTEN=addr:port -> local
+               connections there become reverse streams to the server target. */
+            const char *rl = getenv ("PM_RLISTEN");
+            const char *rl_addr = NULL; int rl_port = 0; int rl_proto = 0;
+            char buf[256];
+            if (rl) {
+                /* optional proto prefix: PM_RLISTEN=both:127.0.0.1:5301 */
+                if (strncmp (rl, "both:", 5) == 0) { rl_proto = 2; rl += 5; }
+                else if (strncmp (rl, "udp:", 4) == 0) { rl_proto = 1; rl += 4; }
+                else if (strncmp (rl, "tcp:", 4) == 0) { rl_proto = 0; rl += 4; }
+                if (strrchr (rl, ':')) {
+                    snprintf (buf, sizeof buf, "%s", rl);
+                    char *c = strrchr (buf, ':'); *c = '\0';
+                    rl_addr = buf; rl_port = atoi (c + 1);
+                }
+            }
+            rc = portmux_add_tunnel_client (g_pm, rl_addr, rl_port, addr1, port1,
                                             addr2, port2, psk, cipher, NULL);
+            if (rc == 0 && rl_port > 0) portmux_tunnel_set_reverse_proto (g_pm, rl_proto);
+        }
         /* wipe the local PSK copy from this stack frame */
         memset (psk, 0, sizeof psk);
         if (rc < 0) {

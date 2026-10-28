@@ -80,7 +80,7 @@ bridge_roundtrip (const char *msg)
     struct sockaddr_in a = { 0 };
     a.sin_family = AF_INET;
     a.sin_addr.s_addr = htonl (INADDR_LOOPBACK);
-    a.sin_port = htons (BRIDGE_PORT);
+    a.sin_port = htons (TUN_PORT);  /* B1 single-port: data clients hit the carrier port */
     struct timeval tv = { 5, 0 };
     setsockopt (fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     if (connect (fd, (struct sockaddr *)&a, sizeof a) < 0) { close (fd); return -1; }
@@ -100,7 +100,7 @@ bridge_exchange (void)
     struct sockaddr_in a = { 0 };
     a.sin_family = AF_INET;
     a.sin_addr.s_addr = htonl (INADDR_LOOPBACK);
-    a.sin_port = htons (BRIDGE_PORT);
+    a.sin_port = htons (TUN_PORT);  /* B1 single-port: data clients hit the carrier port */
     struct timeval tv = { 5, 0 };
     setsockopt (fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     if (connect (fd, (struct sockaddr *)&a, sizeof a) < 0) { close (fd); return -1; }
@@ -137,7 +137,7 @@ main (void)
     /* Server: encrypted listener :TUN_PORT, laptop bridge :BRIDGE_PORT. */
     g_server = portmux_new ();
     if (portmux_add_tunnel_server (g_server, "127.0.0.1", TUN_PORT,
-                                   "127.0.0.1", BRIDGE_PORT, psk,
+                                   "127.0.0.1", 0, psk,   /* B1 single-port (no bridge) */
                                    PM_TUNNEL_CIPHER_AESGCM) < 0) {
         fprintf (stderr, "add_tunnel_server failed\n"); return 1;
     }
