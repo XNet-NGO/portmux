@@ -21,7 +21,11 @@ fast, while doing three jobs the hard tools usually need root or a TUN for:
   certs/PKI) that a CGNAT'd device dials **outbound**; many flows are muxed over
   one connection, and **multi-hop jump routing** source-routes a stream across
   relay peers, each hop its own hop-by-hop-encrypted carrier (`ssh -J`, but
-  userspace and TUN-free).
+  userspace and TUN-free). **Reverse multi-hop** (v0.7.0) lets a connection
+  accepted at the far TERMINAL travel BACK UP the same chain to the edge, so you
+  can `adb connect` a CGNAT'd phone that only ever dials out (`ssh -R` across a
+  jump chain): set `PM_RLISTEN` on the terminal `tunnel-peer` and `PM_RTARGET`
+  on the edge `tunnel-client`.
 
 No TUN, no `VpnService`, no root for the loopback/source-bind/tunnel-client
 cases. Linux only (it uses epoll and an ELF coroutine context switch).

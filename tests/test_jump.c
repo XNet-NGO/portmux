@@ -37,6 +37,20 @@
 
 static volatile int echo_run = 1;
 
+/* Per-connection echo handler. Real adbd serves many concurrent connections;
+   handling each accepted socket on its own detached thread models that (and
+   avoids serializing two independent chains that share one echo target). */
+static void *
+echo_conn (void *arg)
+{
+    int c = *(int *)arg; free (arg);
+    char buf[4096]; ssize_t n;
+    while ((n = recv (c, buf, sizeof buf, 0)) > 0)
+        if (send (c, buf, n, 0) < 0) break;
+    close (c);
+    return NULL;
+}
+
 static void *
 echo_thread (void *arg)
 {
@@ -54,10 +68,9 @@ echo_thread (void *arg)
         if (select (fd + 1, &r, 0, 0, &tv) <= 0) continue;
         int c = accept (fd, 0, 0);
         if (c < 0) continue;
-        char buf[4096]; ssize_t n;
-        while ((n = recv (c, buf, sizeof buf, 0)) > 0)
-            if (send (c, buf, n, 0) < 0) break;
-        close (c);
+        pthread_t et; int *cp = malloc (sizeof (int)); *cp = c;
+        if (pthread_create (&et, NULL, echo_conn, cp) == 0) pthread_detach (et);
+        else { close (c); free (cp); }
     }
     close (fd);
     return NULL;

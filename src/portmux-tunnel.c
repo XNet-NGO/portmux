@@ -34,6 +34,7 @@
 
 #include "portmux.h"
 #include "portmux-tunnel.h"
+#include "portmux-relaybind.h"
 #include "portmux-log.h"
 #include "portmux-addr.h"
 #include "portmux-internal.h"
@@ -78,6 +79,10 @@ typedef struct
        OPENJ (multi-hop) instead of plain OPEN for each accepted local client. */
     int jump_set;                        /* 1 => emit OPENJ with @jump */
     PmJumpList jump;                     /* hops[0] is this entry's carrier dest */
+    /* TERMINAL peer reverse listener (reverse multi-hop): a peer configured via
+       portmux_tunnel_peer_set_rlisten opens a plain local listener; each accept
+       emits OPENR up the inbound carrier to the edge. Reuses rlisten_* above. */
+    int is_reverse_terminal;             /* 1 => peer is a reverse terminal     */
 } PmTunnelCfg;
 
 /* reverse-listener proto set */
@@ -410,6 +415,8 @@ typedef struct
        this stream and sendto()s replies back to it. Unused for TCP. */
     struct sockaddr_storage src; socklen_t srclen;
     int rlisten_fd;              /* reverse-UDP flow: listener fd for sendto */
+    int is_uplink;               /* reverse terminal: this slot is the prime
+                                    stream (no local fd; marks the uplink) */
 } MuxStream;
 
 typedef struct
@@ -483,22 +490,42 @@ typedef struct
        hops[1..] + target. */
     int jump_set;
     PmJumpList jump;
+
+    /* EDGE reverse mode: when jump_set AND a reverse target is set, the edge
+       sends ONE "prime" OPENJ at carrier-up to build the whole carrier chain
+       and arm the terminal's reverse listener, WITHOUT any forward client. The
+       returning OPENR streams then ride those carriers back to this edge, which
+       connects rtarget_addr:rtarget_port. @prime_sent guards one-shot emission. */
+    int prime_sent;
+
+    /* TERMINAL peer reverse listener: a peer configured via
+       portmux_tunnel_peer_set_rlisten opens a plain listener; each accept
+       ORIGINATES a reverse stream (OPENR) sent UP the inbound carrier (which
+       the peer learned is the reverse uplink when it received a terminal OPENJ
+       with a reverse-capable edge). Peers accept carriers on accept_fd, so the
+       reverse listener fds live here too (reusing rlisten_tcp_fd). */
+    int is_reverse_terminal;     /* 1 => OPENJ nhops==0 arms the uplink        */
+    unsigned int uplink_id;      /* terminal: prime stream id (reverse uplink) */
+    int have_uplink;             /* terminal: 1 once the uplink is armed       */
 } MuxCtx;
 
-/* A pending next-hop dial, handed to a dialer task. Dials @next as an initiator
-   carrier (shared PSK/cipher), sends OPENJ(@rest), and splices @local_fd (the
-   peer end of the inbound-stream socketpair) to that carrier's single stream. */
+/* A relay request: a peer accepted an inbound carrier (@a_fd, already handshaked
+   with @a_tx/@a_rx) whose FIRST record is an OPENJ with hops left. We hand the
+   whole inbound carrier to a dedicated relay task that dials the next hop as a
+   full outbound carrier and runs a symmetric TWO-carrier mux between them (see
+   peer_relay_task). @first_* is that first decrypted record (OPENJ). */
 typedef struct
 {
     Portmux        *self;
-    int             local_fd;    /* our end of the socketpair (relay splice)  */
-    PmJumpEndpoint  next;        /* next-hop carrier to dial                  */
-    PmJumpList      rest;        /* jump-list to forward (nhops-1 + target)   */
+    int             a_fd;            /* inbound carrier (toward the edge)      */
+    NoiseCipherState *a_tx, *a_rx;   /* inbound carrier cipher states          */
+    unsigned char  *first;           /* first decrypted record (heap, owned)   */
+    size_t          first_len;
     const unsigned char *psk;
     PmTunnelCipher  cipher;
     PortmuxEgress   egress;
     int             egress_valid;
-} PmPeerDial;
+} PmPeerRelay;
 
 /* Resolve a 16-bit stream id to its MuxStream slot (origin bit -> table half). */
 static MuxStream *
@@ -669,9 +696,10 @@ pm_mux_nonblock (int fd)
     if (fl >= 0) fcntl (fd, F_SETFL, fl | O_NONBLOCK);
 }
 
-/* Spawn a next-hop dialer task (defined after the peer task). Returns 0/-1. */
-static int peer_spawn_dial (MuxCtx *m, int local_fd,
-                            const PmJumpEndpoint *next, const PmJumpList *rest);
+/* Spawn a two-carrier relay task (defined after the peer task). Returns 0/-1. */
+static int peer_spawn_relay (MuxCtx *m, int a_fd,
+                             NoiseCipherState *a_tx, NoiseCipherState *a_rx,
+                             const unsigned char *first, size_t flen);
 
 /* Dispatch one fully-received inbound carrier record. OPEN is bidirectional:
  * a FORWARD OPEN (origin bit clear) is handled by the CLIENT (connect to its
@@ -685,20 +713,29 @@ mux_dispatch (MuxCtx *m, unsigned char type, unsigned int id,
     MuxStream *st = mux_slot (m, id);
     int reverse = (id & PM_MUX_ORIGIN) != 0;
 
-    if (type == PM_MUX_OPEN) {
-        /* The end that did NOT originate this stream connects to its target. */
+    if (type == PM_MUX_OPEN || type == PM_MUX_OPENR) {
+        /* OPEN  : forward stream; the NON-originating end connects its target.
+           OPENR : reverse stream that travelled BACK UP the chain; the EDGE
+                   (a tunnel-client with a reverse target) connects rtarget.
+           The reverse responder is generalized from "server only" to also the
+           reverse-mode EDGE (jump_set + rtarget), so a CGNAT'd phone edge that
+           dialed OUT can still be the one that connects adbd on a reverse open. */
         const char *addr; int port;
-        if (!reverse && !m->is_server) {          /* forward OPEN -> client */
+        int reverse_responder = m->is_server || (m->jump_set && m->rtarget_port > 0);
+        if (type == PM_MUX_OPEN && !reverse && !m->is_server) { /* forward -> client */
             addr = m->target_addr; port = m->target_port;
-        } else if (reverse && m->is_server) {     /* reverse OPEN -> server */
+        } else if (type == PM_MUX_OPENR && reverse_responder) { /* reverse -> edge/server */
+            if (m->rtarget_port <= 0) { mux_queue_out (m, PM_MUX_CLOSE, id, NULL, 0); return; }
+            addr = m->rtarget_addr; port = m->rtarget_port;
+        } else if (type == PM_MUX_OPEN && reverse && m->is_server) { /* legacy single-hop reverse */
             if (m->rtarget_port <= 0) { mux_queue_out (m, PM_MUX_CLOSE, id, NULL, 0); return; }
             addr = m->rtarget_addr; port = m->rtarget_port;
         } else {
             return;                               /* OPEN we shouldn't receive */
         }
         int proto = (pn >= 1) ? pl[0] : PM_MUX_PROTO_TCP;   /* payload[0]=proto */
-        PM_LOG_I ("tunnel: OPEN stream 0x%04x (%s %s) -> connecting %s:%d",
-                  id, reverse ? "reverse" : "forward",
+        PM_LOG_I ("tunnel: %s stream 0x%04x (%s) -> connecting %s:%d",
+                  type == PM_MUX_OPENR ? "OPENR" : "OPEN", id,
                   proto == PM_MUX_PROTO_UDP ? "udp" : "tcp", addr, port);
         int fd = mux_connect_to (m, addr, port, proto);
         if (fd < 0) { PM_LOG_W ("tunnel: target connect failed (stream 0x%04x)", id); mux_queue_out (m, PM_MUX_CLOSE, id, NULL, 0); return; }
@@ -707,12 +744,10 @@ mux_dispatch (MuxCtx *m, unsigned char type, unsigned int id,
         st->is_udp = (proto == PM_MUX_PROTO_UDP);
         PM_LOG_I ("tunnel: stream 0x%04x target connected fd=%d", id, fd);
     } else if (type == PM_MUX_OPENJ) {
-        /* Multi-hop OPEN. Only valid on the forward half, received by a peer
-           (or a terminal server acting as the last hop). OPENJ is origin-
-           agnostic: it is always a forward request toward the target, whether
-           the carrier was dialed by the edge (client-originated id) or by an
-           upstream peer's dialer (server-originated id). Only the responder
-           end (peer/server) acts on it. */
+        /* Multi-hop OPEN, received by a peer/terminal. A RELAY carrier (OPENJ
+           with hops left) is detected and handed to peer_relay_task BEFORE the
+           carrier is installed in this mux loop (see the accept path), so here
+           we only ever see a TERMINAL OPENJ (nhops==0). */
         if (!(m->is_peer || m->is_server)) { mux_queue_out (m, PM_MUX_CLOSE, id, NULL, 0); return; }
         PmJumpList jl;
         if (pm_jumplist_decode (pl, pn, &jl) < 0) {
@@ -720,7 +755,20 @@ mux_dispatch (MuxCtx *m, unsigned char type, unsigned int id,
             mux_queue_out (m, PM_MUX_CLOSE, id, NULL, 0); return;
         }
         if (jl.nhops == 0) {
-            /* Terminal hop: connect the final target locally (like OPEN). */
+            if (m->is_reverse_terminal) {
+                /* Reverse TERMINAL: this OPENJ is the edge's chain-prime. Do NOT
+                   connect a target. Record this carrier+stream as the reverse
+                   uplink: subsequent reverse-listener accepts emit OPENR on it,
+                   relayed back up to the edge (which connects its rtarget). */
+                mux_close_stream (m, id);
+                st->fd = -1;
+                st->is_uplink = 1;        /* mark the prime stream slot */
+                m->uplink_id = id;
+                m->have_uplink = 1;
+                PM_LOG_I ("tunnel: reverse uplink armed via stream 0x%04x", id);
+                return;
+            }
+            /* Forward terminal hop: connect the final target locally. */
             PM_LOG_I ("tunnel: OPENJ stream 0x%04x terminal -> %s:%d (%s)",
                       id, jl.target.addr, jl.target.port,
                       jl.proto == PM_MUX_PROTO_UDP ? "udp" : "tcp");
@@ -731,37 +779,10 @@ mux_dispatch (MuxCtx *m, unsigned char type, unsigned int id,
             st->is_udp = (jl.proto == PM_MUX_PROTO_UDP);
             return;
         }
-        /* Relay hop: need peer mode (a dialer + egress). A plain server that is
-           not a peer cannot relay onward. */
-        if (!m->is_peer) {
-            PM_LOG_W ("tunnel: OPENJ with %d hops but not a peer (stream 0x%04x)", jl.nhops, id);
-            mux_queue_out (m, PM_MUX_CLOSE, id, NULL, 0); return;
-        }
-        PmJumpList rest; PmJumpEndpoint next;
-        if (pm_jumplist_pop (&jl, &rest, &next) < 0) { mux_queue_out (m, PM_MUX_CLOSE, id, NULL, 0); return; }
-        /* Loop protection is the PM_MUX_MAX_HOPS cap (bounded above): each relay
-           pops one hop, so a chain can traverse at most MAX_HOPS peers and
-           cannot loop forever. We intentionally do NOT reject a next-hop by
-           port alone — a relay peer legitimately forwards to a DIFFERENT host
-           on the SAME port (e.g. prod:2301 -> runner:2301), which a port-only
-           self-check falsely flags. (A precise same-host+port self check would
-           need the peer to know its own routable address, which it may not.) */
-        int sp[2];
-        if (socketpair (AF_UNIX, SOCK_STREAM, 0, sp) < 0) { mux_queue_out (m, PM_MUX_CLOSE, id, NULL, 0); return; }
-        /* sp[0] = this inbound stream's local fd (spliced carrier<->sp[0] by the
-           normal mux loop). sp[1] = handed to the next-hop dialer task. */
-        pm_mux_nonblock (sp[0]);
-        hev_task_add_fd (hev_task_self (), sp[0], POLLIN);
-        mux_close_stream (m, id);
-        st->fd = sp[0];
-        st->is_udp = 0;
-        PM_LOG_I ("tunnel: OPENJ stream 0x%04x relay -> next hop %s:%d (%d hop(s) left)",
-                  id, next.addr, next.port, rest.nhops);
-        if (peer_spawn_dial (m, sp[1], &next, &rest) < 0) {
-            mux_close_stream (m, id);       /* closes sp[0] */
-            close (sp[1]);
-            mux_queue_out (m, PM_MUX_CLOSE, id, NULL, 0);
-        }
+        /* An installed carrier should never carry OPENJ-with-hops (relays are
+           split off at accept). Defensive: refuse. */
+        PM_LOG_W ("tunnel: unexpected OPENJ with %d hops on installed carrier (stream 0x%04x)", jl.nhops, id);
+        mux_queue_out (m, PM_MUX_CLOSE, id, NULL, 0);
     } else if (type == PM_MUX_DATA) {
         if (pn == 0) return;
         /* UDP reverse flow (client side): no own fd; deliver the datagram back
@@ -885,6 +906,24 @@ mux_reverse_recv_udp (MuxCtx *m, int lfd, unsigned char *rbuf)
     return progress;
 }
 
+/* Read ONE decrypted mux record from a freshly-handshaked carrier @fd into
+   @buf (cap PM_TUNNEL_MAX_NOISE_MSG), blocking cooperatively. Returns the
+   plaintext length (>=0) or -1 on error/eof. Used by a peer to classify an
+   inbound carrier (relay-with-hops vs terminal) before committing it to the
+   mux loop. @frame scratch must be >= PM_TUNNEL_MAX_NOISE_MSG. */
+static int
+carrier_read_one (Portmux *self, int fd, NoiseCipherState *rx,
+                  unsigned char *buf, unsigned char *frame)
+{
+    int n = frame_read (self, fd, frame, PM_TUNNEL_MAX_NOISE_MSG);
+    if (n <= 0) return -1;
+    NoiseBuffer mb;
+    memcpy (buf, frame, (size_t)n);
+    noise_buffer_set_inout (mb, buf, (size_t)n, PM_TUNNEL_MAX_NOISE_MSG);
+    if (noise_cipherstate_decrypt (rx, &mb) != NOISE_ERROR_NONE) return -1;
+    return (int)mb.size;
+}
+
 static void
 mux_run (MuxCtx *m)
 {
@@ -903,6 +942,9 @@ mux_run (MuxCtx *m)
         hev_task_add_fd (hev_task_self (), m->rlisten_tcp_fd, POLLIN);
     if (!m->is_server && m->rlisten_udp_fd >= 0)
         hev_task_add_fd (hev_task_self (), m->rlisten_udp_fd, POLLIN);
+    /* terminal peer: its reverse listener (accepts become OPENR up the chain) */
+    if (m->is_server && m->is_reverse_terminal && m->rlisten_tcp_fd >= 0)
+        hev_task_add_fd (hev_task_self (), m->rlisten_tcp_fd, POLLIN);
 
     while (m->alive && m->self->run) {
         int progress = 0;
@@ -912,6 +954,66 @@ mux_run (MuxCtx *m)
         if (!m->is_server && m->carrier_fd >= 0 && outring_has_room (m)) {
             if (m->rlisten_tcp_fd >= 0 && mux_reverse_accept_tcp (m, m->rlisten_tcp_fd)) progress = 1;
             if (m->rlisten_udp_fd >= 0 && mux_reverse_recv_udp (m, m->rlisten_udp_fd, rbuf)) progress = 1;
+        }
+
+        /* 0b-r. EDGE reverse mode: once the carrier is up, send ONE "prime"
+                 OPENJ to build the whole carrier chain and arm the terminal's
+                 reverse listener. The returning OPENR streams ride these
+                 carriers back to this edge, which connects its reverse target.
+                 Triggered when jump_set AND a reverse target is configured. */
+        if (!m->is_server && m->carrier_fd >= 0 && m->jump_set
+            && m->rtarget_port > 0 && !m->prime_sent && outring_has_room (m)) {
+            PmJumpList rest; PmJumpEndpoint first;
+            if (m->jump.nhops >= 1) pm_jumplist_pop (&m->jump, &rest, &first);
+            else rest = m->jump;
+            unsigned char jbuf[1 + 1 + PM_MUX_MAX_HOPS * (1 + PM_MUX_ADDR_MAX + 2) + (1 + PM_MUX_ADDR_MAX + 2)];
+            int jn = pm_jumplist_encode (&rest, jbuf, sizeof jbuf);
+            unsigned int slot = mux_alloc_rslot (m);
+            if (jn > 0 && slot) {
+                unsigned int id = PM_MUX_ORIGIN | slot;
+                m->streams[1][slot].fd = -1;
+                m->streams[1][slot].is_uplink = 1;   /* control stream; no fd   */
+                if (mux_queue_out (m, PM_MUX_OPENJ, id, jbuf, (size_t)jn) == 0) {
+                    m->prime_sent = 1;
+                    PM_LOG_I ("tunnel-client: reverse chain prime -> stream 0x%04x (%d hop(s) after carrier)", id, rest.nhops);
+                } else {
+                    m->streams[1][slot].is_uplink = 0;
+                }
+            }
+            progress = 1;
+        }
+
+        /* 0b-t. TERMINAL peer reverse listener: a peer configured with a reverse
+                 listener accepts local plaintext clients; once its uplink is
+                 armed (the edge's prime OPENJ arrived), each accept ORIGINATES a
+                 reverse stream (OPENR) sent UP the inbound carrier, relayed back
+                 to the edge which connects its reverse target. */
+        if (m->is_server && m->is_reverse_terminal && m->carrier_fd >= 0
+            && m->have_uplink && m->rlisten_tcp_fd >= 0 && outring_has_room (m)) {
+            for (int b = 0; b < 4 && outring_has_room (m); b++) {
+                struct sockaddr_storage rp; socklen_t rl = sizeof rp;
+                int rfd = accept (m->rlisten_tcp_fd, (struct sockaddr *)&rp, &rl);
+                if (rfd < 0) break;
+                /* allocate a server-originated (origin-clear) forward slot */
+                unsigned int slot = 0;
+                for (unsigned int k = 0; k < PM_MUX_MAX_STREAMS; k++) {
+                    unsigned int c = (m->next_id + k) % PM_MUX_MAX_STREAMS;
+                    if (c == 0) continue;
+                    if (m->streams[0][c].fd < 0 && !m->streams[0][c].is_uplink) { slot = c; break; }
+                }
+                if (slot == 0) { close (rfd); continue; }
+                m->next_id = (slot + 1) % PM_MUX_MAX_STREAMS;
+                unsigned int id = slot;              /* origin clear */
+                pm_set_nodelay (rfd);
+                pm_mux_nonblock (rfd);
+                hev_task_add_fd (hev_task_self (), rfd, POLLIN);
+                m->streams[0][slot].fd = rfd;
+                m->streams[0][slot].is_udp = 0;
+                unsigned char proto = PM_MUX_PROTO_TCP;
+                if (mux_queue_out (m, PM_MUX_OPENR, id, &proto, 1) < 0) mux_close_stream (m, id);
+                else PM_LOG_I ("tunnel-peer: reverse client -> stream 0x%04x (OPENR up chain)", id);
+                progress = 1;
+            }
         }
 
         /* 0. server: accept connections on the SINGLE public listener and
@@ -935,6 +1037,62 @@ mux_run (MuxCtx *m)
                         PM_LOG_W ("tunnel-server: carrier handshake rejected (bad PSK?)");
                         hev_task_del_fd (hev_task_self (), afd); close (afd);
                         continue;
+                    }
+                    /* PEER: classify the carrier by its FIRST record. An OPENJ
+                       with hops left means this carrier is a RELAY leg: hand the
+                       whole carrier to a dedicated two-carrier relay task (which
+                       dials the next hop and carries the full symmetric mux,
+                       forward AND reverse). Anything else (terminal OPENJ, plain
+                       OPEN, OPENR) is served by this mux loop as the carrier. */
+                    if (m->is_peer) {
+                        int rn = carrier_read_one (m->self, afd, rx, rbuf, m->framebuf);
+                        if (rn < PM_MUX_HDR) {
+                            PM_LOG_W ("tunnel-peer: empty/short first record; dropping carrier");
+                            if (tx) noise_cipherstate_free (tx);
+                            if (rx) noise_cipherstate_free (rx);
+                            hev_task_del_fd (hev_task_self (), afd); close (afd);
+                            continue;
+                        }
+                        unsigned char ftype = rbuf[0];
+                        int is_relay = 0;
+                        if (ftype == PM_MUX_OPENJ) {
+                            PmJumpList jl;
+                            if (pm_jumplist_decode (rbuf + PM_MUX_HDR, (size_t)rn - PM_MUX_HDR, &jl) == 0
+                                && jl.nhops > 0)
+                                is_relay = 1;
+                        }
+                        if (is_relay) {
+                            hev_task_del_fd (hev_task_self (), afd);  /* relay task re-adds it */
+                            if (peer_spawn_relay (m, afd, tx, rx, rbuf, (size_t)rn) < 0) {
+                                if (tx) noise_cipherstate_free (tx);
+                                if (rx) noise_cipherstate_free (rx);
+                                close (afd);
+                            }
+                            progress = 1;
+                            continue;                  /* carrier handed off */
+                        }
+                        /* terminal/normal carrier: install it, then dispatch the
+                           first record we already consumed. */
+                        if (m->carrier_fd >= 0) {
+                            hev_task_del_fd (hev_task_self (), m->carrier_fd);
+                            close (m->carrier_fd);
+                            if (m->tx) noise_cipherstate_free (m->tx);
+                            if (m->rx) noise_cipherstate_free (m->rx);
+                            mux_close_all_streams (m);
+                            m->out_head = m->out_tail = 0;
+                            m->ihdr_got = 0; m->have_ilen = 0;
+                            m->have_uplink = 0;
+                        }
+                        m->carrier_fd = afd; m->tx = tx; m->rx = rx;
+                        hev_task_mod_fd (hev_task_self (), afd, POLLIN | POLLOUT);
+                        PM_LOG_I ("tunnel-peer: terminal carrier up (:%d)", m->accept_port);
+                        {
+                            unsigned char ft = rbuf[0];
+                            unsigned int fid = ((unsigned int)rbuf[1] << 8) | rbuf[2];
+                            mux_dispatch (m, ft, fid, rbuf + PM_MUX_HDR, (size_t)rn - PM_MUX_HDR);
+                        }
+                        progress = 1;
+                        break;
                     }
                     /* replace any prior carrier (phone reconnected) */
                     if (m->carrier_fd >= 0) {
@@ -1088,6 +1246,8 @@ out:
     mux_close_all_streams (m);
     if (m->is_server && m->accept_fd >= 0)
         hev_task_del_fd (hev_task_self (), m->accept_fd);
+    if (m->is_server && m->is_reverse_terminal && m->rlisten_tcp_fd >= 0)
+        hev_task_del_fd (hev_task_self (), m->rlisten_tcp_fd);  /* detach; cfg owns/closes */
     if (!m->is_server && m->rlisten_tcp_fd >= 0)
         hev_task_del_fd (hev_task_self (), m->rlisten_tcp_fd);  /* detach; task owns/closes */
     if (!m->is_server && m->rlisten_udp_fd >= 0)
@@ -1152,180 +1312,287 @@ peek_is_carrier (Portmux *self, int fd)
     return (b[0] == 0x00 && b[1] == PM_CARRIER_FIRST_LEN) ? 1 : 0;
 }
 
-/* ───────────────────────── peer: next-hop dialer ─────────────────────────
- * A relay hop (peer receiving OPENJ with hops left) hands us one end of a
- * socketpair (@local_fd) spliced to the inbound stream, plus the remaining
- * jump-list. We dial @next as an initiator carrier (shared PSK), send an
- * OPENJ(@rest) on stream 0x0001, then pump bytes both ways until either side
- * closes. This is a minimal single-stream relay (not the full mux_run): the
- * next hop sees exactly one forward stream whose "payload" is OPENJ then DATA.
- */
-static int
-dialer_send_rec (int fd, NoiseCipherState *tx, unsigned char *scratch,
-                 unsigned char type, unsigned int id,
-                 const unsigned char *payload, size_t plen)
+/* ───────────────────────── peer: two-carrier relay ─────────────────────────
+ * A relay hop runs a FULL symmetric mux between TWO Noise carriers:
+ *   a = inbound  (toward the EDGE; the carrier this peer accepted)
+ *   b = outbound (toward the TERMINAL; dialed here as an initiator)
+ * Every record that crosses the hop is re-keyed from its id on one carrier to a
+ * freshly-allocated id on the other (PmRelayBindTable), so FORWARD streams
+ * (OPENJ, dialed by the edge) and REVERSE streams (OPENR, originated by the
+ * terminal) share the same carrier pair with no id collisions. Unlike the old
+ * single-stream byte pump this carries arbitrary concurrent streams in BOTH
+ * directions, which is what makes reverse multi-hop possible. One task owns
+ * BOTH carrier fds (hev-task binds each fd to one task), so writes are
+ * naturally serialized and never interleave. */
+
+/* Per-carrier framed-record reassembly + encrypt helpers for the relay. */
+typedef struct
 {
-    unsigned char *body = scratch + 2;
+    int fd;
+    NoiseCipherState *tx, *rx;
+    unsigned char *inbuf;        /* PM_TUNNEL_MAX_NOISE_MSG (heap)           */
+    unsigned char *scratch;      /* 2 + PM_TUNNEL_MAX_NOISE_MSG (heap)       */
+    unsigned char ihdr[2];
+    size_t ihdr_got, ibody_len, ibody_got;
+    int have_ilen;
+} RelayCarrier;
+
+/* Seal + send one mux record on a relay carrier. Blocking (yields on EAGAIN);
+   one task owns the fd so there is no interleave. Returns 0/-1. */
+static int
+relay_send_rec (RelayCarrier *c, Portmux *self, unsigned char type,
+                unsigned int id, const unsigned char *payload, size_t plen)
+{
+    unsigned char *body = c->scratch + 2;
     body[0] = type;
     body[1] = (unsigned char)((id >> 8) & 0xff);
     body[2] = (unsigned char)(id & 0xff);
     if (plen) memcpy (body + PM_MUX_HDR, payload, plen);
     NoiseBuffer mb;
     noise_buffer_set_inout (mb, body, PM_MUX_HDR + plen, PM_TUNNEL_MAX_NOISE_MSG);
-    if (noise_cipherstate_encrypt (tx, &mb) != NOISE_ERROR_NONE) return -1;
-    scratch[0] = (unsigned char)((mb.size >> 8) & 0xff);
-    scratch[1] = (unsigned char)(mb.size & 0xff);
+    if (noise_cipherstate_encrypt (c->tx, &mb) != NOISE_ERROR_NONE) return -1;
+    c->scratch[0] = (unsigned char)((mb.size >> 8) & 0xff);
+    c->scratch[1] = (unsigned char)(mb.size & 0xff);
     size_t total = mb.size + 2, off = 0;
     while (off < total) {
-        ssize_t s = send (fd, scratch + off, total - off, 0);
+        ssize_t s = send (c->fd, c->scratch + off, total - off, MSG_DONTWAIT);
         if (s > 0) { off += (size_t)s; continue; }
-        if (s < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { hev_task_yield (HEV_TASK_WAITIO); continue; }
+        if (s < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (!self->run) return -1;
+            hev_task_yield (HEV_TASK_WAITIO); continue;
+        }
         return -1;
     }
     return 0;
 }
 
-static void
-peer_dialer_task (void *data)
+/* Non-blocking: try to read ONE complete decrypted record from carrier @c.
+   Returns the plaintext length (>=0) into @c->inbuf on success, -1 on
+   would-block (nothing ready), -2 on carrier death/decrypt error. */
+static int
+relay_read_rec (RelayCarrier *c)
 {
-    PmPeerDial *d = data;
-    Portmux *self = d->self;
+    while (c->ihdr_got < 2) {
+        ssize_t h = recv (c->fd, c->ihdr + c->ihdr_got, 2 - c->ihdr_got, MSG_DONTWAIT);
+        if (h > 0) { c->ihdr_got += (size_t)h; continue; }
+        if (h == 0) return -2;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return -1;
+        return -2;
+    }
+    if (!c->have_ilen) {
+        c->ibody_len = ((size_t)c->ihdr[0] << 8) | c->ihdr[1];
+        c->ibody_got = 0; c->have_ilen = 1;
+        if (c->ibody_len == 0 || c->ibody_len > PM_TUNNEL_MAX_NOISE_MSG) return -2;
+    }
+    while (c->ibody_got < c->ibody_len) {
+        ssize_t b = recv (c->fd, c->inbuf + c->ibody_got, c->ibody_len - c->ibody_got, MSG_DONTWAIT);
+        if (b > 0) { c->ibody_got += (size_t)b; continue; }
+        if (b == 0) return -2;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return -1;
+        return -2;
+    }
+    NoiseBuffer mb;
+    noise_buffer_set_inout (mb, c->inbuf, c->ibody_len, PM_TUNNEL_MAX_NOISE_MSG);
+    c->ihdr_got = 0; c->have_ilen = 0;
+    if (noise_cipherstate_decrypt (c->rx, &mb) != NOISE_ERROR_NONE) return -2;
+    return (int)mb.size;
+}
+
+/* Forward one record arriving on @src (its id space) onto @dst, remapping the
+   id via the binding table. Handled inline in peer_relay_task below. */
+
+static void
+peer_relay_task (void *data)
+{
+    PmPeerRelay *pr = data;
+    Portmux *self = pr->self;
     PmTaskNode node;
-    NoiseCipherState *tx = NULL, *rx = NULL;
-    int cfd = -1;
-    unsigned char *scratch = NULL, *inbuf = NULL, *lbuf = NULL;
+    RelayCarrier a = { 0 }, b = { 0 };
+    PmRelayBindTable *binds = NULL;
+    NoiseCipherState *btx = NULL, *brx = NULL;
+    int bfd = -1;
+    PmJumpList first_jl, rest; PmJumpEndpoint next;
+    int armed = 0;
+    unsigned char *jscratch = NULL;
+#define PM_JSCRATCH_CAP (1 + 1 + PM_MUX_MAX_HOPS * (1 + PM_MUX_ADDR_MAX + 2) + (1 + PM_MUX_ADDR_MAX + 2))
 
     pm_task_register (self, &node);
 
-    struct sockaddr_storage ss; socklen_t sslen;
-    int family = portmux_resolve (d->next.addr, d->next.port, SOCK_STREAM, 0, &ss, &sslen);
-    if (family < 0) goto done;
+    binds = calloc (1, sizeof *binds);
+    a.inbuf   = malloc (PM_TUNNEL_MAX_NOISE_MSG);
+    a.scratch = malloc (2 + PM_TUNNEL_MAX_NOISE_MSG);
+    b.inbuf   = malloc (PM_TUNNEL_MAX_NOISE_MSG);
+    b.scratch = malloc (2 + PM_TUNNEL_MAX_NOISE_MSG);
+    jscratch  = malloc (PM_JSCRATCH_CAP);
+    if (!binds || !a.inbuf || !a.scratch || !b.inbuf || !b.scratch || !jscratch) goto done;
+    pm_relaybind_init (binds);
+
+    /* carrier a = the inbound carrier handed to us (already handshaked) */
+    a.fd = pr->a_fd; a.tx = pr->a_tx; a.rx = pr->a_rx;
+    hev_task_add_fd (hev_task_self (), a.fd, POLLIN | POLLOUT);
+
+    /* the first record is OPENJ with hops left: pop the next hop, dial it */
+    if (pr->first_len < PM_MUX_HDR || pr->first[0] != PM_MUX_OPENJ) goto done;
+    unsigned int first_id = ((unsigned int)pr->first[1] << 8) | pr->first[2];
+    if (pm_jumplist_decode (pr->first + PM_MUX_HDR, pr->first_len - PM_MUX_HDR, &first_jl) < 0) goto done;
+    if (pm_jumplist_pop (&first_jl, &rest, &next) < 0) goto done;
 
     {
+        struct sockaddr_storage ss; socklen_t sslen;
+        int family = portmux_resolve (next.addr, next.port, SOCK_STREAM, 0, &ss, &sslen);
+        if (family < 0) goto done;
         PortmuxRoute tmp; memset (&tmp, 0, sizeof tmp);
-        tmp.egress = d->egress; tmp.egress_valid = d->egress_valid;
-        cfd = pm_make_upstream_fd (&tmp, family, SOCK_STREAM);
-    }
-    if (cfd < 0) goto done;
-    pm_clamp_mss (cfd); pm_set_keepalive (cfd);
-    hev_task_add_fd (hev_task_self (), cfd, POLLIN | POLLOUT);
-    if (hev_task_io_socket_connect (cfd, (struct sockaddr *)&ss, sslen,
-                                    pm_run_yielder, self) < 0) goto done;
-    pm_set_nodelay (cfd);
-    if (do_handshake (self, cfd, NOISE_ROLE_INITIATOR, d->psk, d->cipher, &tx, &rx) < 0) {
-        PM_LOG_W ("peer-dialer: handshake to %s:%d failed", d->next.addr, d->next.port);
-        goto done;
-    }
-    PM_LOG_I ("peer-dialer: carrier up to %s:%d; forwarding OPENJ (%d hop(s) left)",
-              d->next.addr, d->next.port, d->rest.nhops);
-
-    scratch = malloc (2 + PM_TUNNEL_MAX_NOISE_MSG);
-    inbuf   = malloc (PM_TUNNEL_MAX_NOISE_MSG);
-    lbuf    = malloc (PM_TUNNEL_MAX_PLAINTEXT - PM_MUX_HDR);
-    if (!scratch || !inbuf || !lbuf) goto done;
-
-    /* send OPENJ(rest) as the single forward stream 0x0001 */
-    {
-        unsigned char jbuf[1 + 1 + PM_MUX_MAX_HOPS * (1 + PM_MUX_ADDR_MAX + 2) + (1 + PM_MUX_ADDR_MAX + 2)];
-        int jn = pm_jumplist_encode (&d->rest, jbuf, sizeof jbuf);
-        if (jn < 0) goto done;
-        if (dialer_send_rec (cfd, tx, scratch, PM_MUX_OPENJ, 0x0001, jbuf, (size_t)jn) < 0) goto done;
-    }
-
-    pm_mux_nonblock (d->local_fd);
-    hev_task_add_fd (hev_task_self (), d->local_fd, POLLIN);
-
-    /* bidirectional pump: local_fd <-> carrier(stream 0x0001) */
-    {
-        size_t ihdr_got = 0, ibody_len = 0, ibody_got = 0; int have_ilen = 0;
-        unsigned char ihdr[2];
-        const size_t lcap = PM_TUNNEL_MAX_PLAINTEXT - PM_MUX_HDR;
-        int dead = 0;
-        while (self->run && !dead) {
-            int progress = 0;
-            /* local -> carrier (DATA) */
-            ssize_t r = recv (d->local_fd, lbuf, lcap, MSG_DONTWAIT);
-            if (r > 0) {
-                if (dialer_send_rec (cfd, tx, scratch, PM_MUX_DATA, 0x0001, lbuf, (size_t)r) < 0) break;
-                progress = 1;
-            } else if (r == 0) {
-                dialer_send_rec (cfd, tx, scratch, PM_MUX_CLOSE, 0x0001, NULL, 0);
-                break;
-            }
-            /* carrier -> local (decrypt records, write DATA to local_fd) */
-            for (int budget = 0; budget < 8; budget++) {
-                while (ihdr_got < 2) {
-                    ssize_t h = recv (cfd, ihdr + ihdr_got, 2 - ihdr_got, MSG_DONTWAIT);
-                    if (h > 0) { ihdr_got += (size_t)h; progress = 1; }
-                    else if (h == 0) { dead = 1; goto pump_yield; }
-                    else if (errno == EAGAIN || errno == EWOULDBLOCK) goto pump_yield;
-                    else { dead = 1; goto pump_yield; }
-                }
-                if (!have_ilen) {
-                    ibody_len = ((size_t)ihdr[0] << 8) | ihdr[1];
-                    ibody_got = 0; have_ilen = 1;
-                    if (ibody_len == 0 || ibody_len > PM_TUNNEL_MAX_NOISE_MSG) { dead = 1; goto pump_yield; }
-                }
-                while (ibody_got < ibody_len) {
-                    ssize_t b = recv (cfd, inbuf + ibody_got, ibody_len - ibody_got, MSG_DONTWAIT);
-                    if (b > 0) { ibody_got += (size_t)b; progress = 1; }
-                    else if (b == 0) { dead = 1; goto pump_yield; }
-                    else if (errno == EAGAIN || errno == EWOULDBLOCK) goto pump_yield;
-                    else { dead = 1; goto pump_yield; }
-                }
-                NoiseBuffer mb;
-                noise_buffer_set_inout (mb, inbuf, ibody_len, PM_TUNNEL_MAX_NOISE_MSG);
-                ihdr_got = 0; have_ilen = 0;
-                if (noise_cipherstate_decrypt (rx, &mb) != NOISE_ERROR_NONE) { dead = 1; goto pump_yield; }
-                if (mb.size >= PM_MUX_HDR) {
-                    unsigned char t = inbuf[0];
-                    if (t == PM_MUX_DATA) {
-                        unsigned char *p = inbuf + PM_MUX_HDR; size_t pn = mb.size - PM_MUX_HDR, off = 0;
-                        while (off < pn) {
-                            ssize_t s = send (d->local_fd, p + off, pn - off, MSG_DONTWAIT);
-                            if (s > 0) { off += (size_t)s; continue; }
-                            if (s < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { hev_task_yield (HEV_TASK_YIELD); continue; }
-                            dead = 1; break;
-                        }
-                    } else if (t == PM_MUX_CLOSE) { dead = 1; }
-                }
-            }
-        pump_yield:
-            if (!progress) hev_task_yield (HEV_TASK_WAITIO);
-            else hev_task_yield (HEV_TASK_YIELD);
+        tmp.egress = pr->egress; tmp.egress_valid = pr->egress_valid;
+        bfd = pm_make_upstream_fd (&tmp, family, SOCK_STREAM);
+        if (bfd < 0) goto done;
+        pm_clamp_mss (bfd); pm_set_keepalive (bfd);
+        hev_task_add_fd (hev_task_self (), bfd, POLLIN | POLLOUT);
+        if (hev_task_io_socket_connect (bfd, (struct sockaddr *)&ss, sslen,
+                                        pm_run_yielder, self) < 0) goto done;
+        pm_set_nodelay (bfd);
+        if (do_handshake (self, bfd, NOISE_ROLE_INITIATOR, pr->psk, pr->cipher, &btx, &brx) < 0) {
+            PM_LOG_W ("peer-relay: handshake to %s:%d failed", next.addr, next.port);
+            goto done;
         }
     }
+    b.fd = bfd; b.tx = btx; b.rx = brx;
+    PM_LOG_I ("peer-relay: carrier up to %s:%d; forwarding OPENJ (%d hop(s) left)",
+              next.addr, next.port, rest.nhops);
+
+    /* Forward the first OPENJ onto carrier b with a fresh forward id, binding
+       a(first_id) <-> b(new). */
+    {
+        unsigned int b_id = pm_relaybind_alloc_side (binds, 1 /*b*/, 0 /*fwd*/);
+        if (b_id == 0 || !pm_relaybind_add (binds, first_id, b_id)) goto done;
+        unsigned char jbuf[1 + 1 + PM_MUX_MAX_HOPS * (1 + PM_MUX_ADDR_MAX + 2) + (1 + PM_MUX_ADDR_MAX + 2)];
+        int jn = pm_jumplist_encode (&rest, jbuf, sizeof jbuf);
+        if (jn < 0) goto done;
+        if (relay_send_rec (&b, self, PM_MUX_OPENJ, b_id, jbuf, (size_t)jn) < 0) goto done;
+    }
+    armed = 1;
+
+    /* steady-state: pump records both ways, remapping ids via @binds. */
+    while (self->run) {
+        int progress = 0, dead = 0;
+
+        /* a -> b */
+        for (int budget = 0; budget < 32; budget++) {
+            int n = relay_read_rec (&a);
+            if (n == -1) break;
+            if (n == -2) { dead = 1; break; }
+            progress = 1;
+            if (n < PM_MUX_HDR) continue;
+            unsigned char t = a.inbuf[0];
+            unsigned int aid = ((unsigned int)a.inbuf[1] << 8) | a.inbuf[2];
+            unsigned char *p = a.inbuf + PM_MUX_HDR; size_t pn = (size_t)n - PM_MUX_HDR;
+            PmRelayBind *bnd = pm_relaybind_lookup_a (binds, aid);
+            if (t == PM_MUX_OPENJ) {
+                /* FORWARD stream crossing a->b: pop one hop and re-encode so the
+                   next hop sees the remaining jump-list (same as the pre-loop
+                   first OPENJ). Every forward OPENJ must be popped, not just the
+                   first. */
+                PmJumpList jl, rst; PmJumpEndpoint nx;
+                if (pm_jumplist_decode (p, pn, &jl) < 0 || pm_jumplist_pop (&jl, &rst, &nx) < 0) { dead = 1; break; }
+                if (!bnd) {
+                    unsigned int bid = pm_relaybind_alloc_side (binds, 1, 0);
+                    if (bid == 0) { dead = 1; break; }
+                    bnd = pm_relaybind_add (binds, aid, bid);
+                    if (!bnd) { dead = 1; break; }
+                }
+                int jn = pm_jumplist_encode (&rst, jscratch, PM_JSCRATCH_CAP);
+                if (jn < 0 || relay_send_rec (&b, self, PM_MUX_OPENJ, bnd->b_id, jscratch, (size_t)jn) < 0) { dead = 1; break; }
+            } else if (t == PM_MUX_OPEN || t == PM_MUX_OPENR) {
+                /* a new (non-jump) stream crossing a->b; fresh b id */
+                int rev = (t == PM_MUX_OPENR);
+                if (!bnd) {
+                    unsigned int bid = pm_relaybind_alloc_side (binds, 1, rev);
+                    if (bid == 0) { dead = 1; break; }
+                    bnd = pm_relaybind_add (binds, aid, bid);
+                    if (!bnd) { dead = 1; break; }
+                }
+                if (relay_send_rec (&b, self, t, bnd->b_id, p, pn) < 0) { dead = 1; break; }
+            } else if (t == PM_MUX_DATA) {
+                if (bnd && relay_send_rec (&b, self, PM_MUX_DATA, bnd->b_id, p, pn) < 0) { dead = 1; break; }
+            } else if (t == PM_MUX_CLOSE) {
+                if (bnd) { relay_send_rec (&b, self, PM_MUX_CLOSE, bnd->b_id, NULL, 0);
+                           pm_relaybind_del_a (binds, aid); }
+            }
+        }
+        if (dead) break;
+
+        /* b -> a */
+        for (int budget = 0; budget < 32; budget++) {
+            int n = relay_read_rec (&b);
+            if (n == -1) break;
+            if (n == -2) { dead = 1; break; }
+            progress = 1;
+            if (n < PM_MUX_HDR) continue;
+            unsigned char t = b.inbuf[0];
+            unsigned int bid = ((unsigned int)b.inbuf[1] << 8) | b.inbuf[2];
+            unsigned char *p = b.inbuf + PM_MUX_HDR; size_t pn = (size_t)n - PM_MUX_HDR;
+            PmRelayBind *bnd = pm_relaybind_lookup_b (binds, bid);
+            if (t == PM_MUX_OPEN || t == PM_MUX_OPENR || t == PM_MUX_OPENJ) {
+                int rev = (t == PM_MUX_OPENR);
+                if (!bnd) {
+                    unsigned int aid = pm_relaybind_alloc_side (binds, 0 /*a*/, rev);
+                    if (aid == 0) { dead = 1; break; }
+                    bnd = pm_relaybind_add (binds, aid, bid);
+                    if (!bnd) { dead = 1; break; }
+                }
+                if (relay_send_rec (&a, self, t, bnd->a_id, p, pn) < 0) { dead = 1; break; }
+            } else if (t == PM_MUX_DATA) {
+                if (bnd && relay_send_rec (&a, self, PM_MUX_DATA, bnd->a_id, p, pn) < 0) { dead = 1; break; }
+            } else if (t == PM_MUX_CLOSE) {
+                if (bnd) { relay_send_rec (&a, self, PM_MUX_CLOSE, bnd->a_id, NULL, 0);
+                           pm_relaybind_del_b (binds, bid); }
+            }
+        }
+        if (dead) break;
+
+        if (!progress) hev_task_yield (HEV_TASK_WAITIO);
+        else hev_task_yield (HEV_TASK_YIELD);
+    }
+    (void)armed;
 
 done:
-    if (tx) noise_cipherstate_free (tx);
-    if (rx) noise_cipherstate_free (rx);
-    free (scratch); free (inbuf); free (lbuf);
-    if (d->local_fd >= 0) { hev_task_del_fd (hev_task_self (), d->local_fd); close (d->local_fd); }
-    if (cfd >= 0) { hev_task_del_fd (hev_task_self (), cfd); close (cfd); }
+    if (a.tx) noise_cipherstate_free (a.tx);
+    if (a.rx) noise_cipherstate_free (a.rx);
+    if (btx) noise_cipherstate_free (btx);
+    if (brx) noise_cipherstate_free (brx);
+    free (a.inbuf); free (a.scratch); free (b.inbuf); free (b.scratch);
+    free (jscratch);
+    free (binds);
+    free (pr->first);
+    if (a.fd >= 0) { hev_task_del_fd (hev_task_self (), a.fd); close (a.fd); }
+    if (bfd >= 0) { hev_task_del_fd (hev_task_self (), bfd); close (bfd); }
     pm_task_unregister (self, &node);
-    free (d);
+    free (pr);
+#undef PM_JSCRATCH_CAP
 }
 
-/* Spawn a dialer task for a relay hop. Takes ownership of @local_fd on success
- * (and always frees its own heap). Returns 0 on spawn, -1 on error. */
+/* Spawn a relay task owning the inbound carrier @a_fd (already handshaked) whose
+   first record @first (len @flen) is an OPENJ-with-hops. Returns 0/-1. On
+   success the task owns a_fd + the ciphers + a copy of @first. */
 static int
-peer_spawn_dial (MuxCtx *m, int local_fd,
-                 const PmJumpEndpoint *next, const PmJumpList *rest)
+peer_spawn_relay (MuxCtx *m, int a_fd, NoiseCipherState *a_tx, NoiseCipherState *a_rx,
+                  const unsigned char *first, size_t flen)
 {
-    PmPeerDial *d = calloc (1, sizeof *d);
-    if (!d) return -1;
-    d->self = m->self;
-    d->local_fd = local_fd;
-    d->next = *next;
-    d->rest = *rest;
-    d->psk = m->psk;
-    d->cipher = m->cipher;
-    d->egress = m->peer_egress;
-    d->egress_valid = m->peer_egress_valid;
+    PmPeerRelay *pr = calloc (1, sizeof *pr);
+    if (!pr) return -1;
+    pr->first = malloc (flen);
+    if (!pr->first) { free (pr); return -1; }
+    memcpy (pr->first, first, flen);
+    pr->first_len = flen;
+    pr->self = m->self;
+    pr->a_fd = a_fd; pr->a_tx = a_tx; pr->a_rx = a_rx;
+    pr->psk = m->psk;
+    pr->cipher = m->cipher;
+    pr->egress = m->peer_egress;
+    pr->egress_valid = m->peer_egress_valid;
 
     HevTask *task = hev_task_new (-1);
-    if (!task) { free (d); return -1; }
-    hev_task_run (task, peer_dialer_task, d);
+    if (!task) { free (pr->first); free (pr); return -1; }
+    hev_task_run (task, peer_relay_task, pr);
     return 0;
 }
 
@@ -1438,6 +1705,11 @@ tunnel_client_task (void *data)
                edge, but harmless). */
             m->jump_set = cfg->jump_set;
             m->jump = cfg->jump;
+            /* EDGE reverse mode: a reverse target makes this client connect it
+               on OPENR that rides the chain back here (reverse multi-hop). */
+            snprintf (m->rtarget_addr, sizeof m->rtarget_addr, "%s",
+                      cfg->rtarget_addr[0] ? cfg->rtarget_addr : "127.0.0.1");
+            m->rtarget_port = cfg->rtarget_port;
             m->psk = cfg->psk;
             m->peer_egress = cfg->egress;
             m->peer_egress_valid = cfg->egress_valid;
@@ -1516,6 +1788,13 @@ tunnel_server_task (void *data)
     m->peer_egress = cfg->egress;      /* reuse route egress for next-hop dials */
     m->peer_egress_valid = cfg->egress_valid;
     m->rlisten_tcp_fd = -1; m->rlisten_udp_fd = -1;  /* server has no reverse listener */
+    /* TERMINAL peer reverse listener: accepts become OPENR up the chain. The
+       listener fd was opened in pm_tunnel_open_server and stashed on cfg. */
+    m->is_reverse_terminal = cfg->is_reverse_terminal;
+    if (cfg->is_reverse_terminal) {
+        m->rlisten_tcp_fd = cfg->rlisten_tcp_fd;
+        m->rlisten_port = cfg->rlisten_port;
+    }
     /* reverse target: where the server connects on a client-originated OPEN */
     snprintf (m->rtarget_addr, sizeof m->rtarget_addr, "%s",
               cfg->rtarget_addr[0] ? cfg->rtarget_addr : "127.0.0.1");
@@ -1529,6 +1808,9 @@ tunnel_server_task (void *data)
     free (m);
 
     close (cfg->listen_fd);
+    if (cfg->is_reverse_terminal && cfg->rlisten_tcp_fd >= 0) {
+        close (cfg->rlisten_tcp_fd); cfg->rlisten_tcp_fd = -1;
+    }
     pm_task_unregister (self, &node);
 }
 
@@ -1578,6 +1860,26 @@ pm_tunnel_open_server (PortmuxRoute *route)
     }
     cfg->listen_fd = fd;
     route->listen_fd = fd;
+
+    /* TERMINAL peer reverse listener (reverse multi-hop): a plain TCP listener
+       whose accepts emit OPENR up the chain. Opened here so it is ready before
+       any carrier arrives; the mux loop accepts on it once the uplink is armed. */
+    if (cfg->is_reverse_terminal && cfg->rlisten_port > 0) {
+        const char *raddr = cfg->rlisten_addr[0] ? cfg->rlisten_addr : "127.0.0.1";
+        struct sockaddr_storage rss; socklen_t rl;
+        int rfam = portmux_resolve (raddr, cfg->rlisten_port, SOCK_STREAM, 1, &rss, &rl);
+        if (rfam < 0) { close (fd); return -1; }
+        int rfd = hev_task_io_socket_socket (rfam, SOCK_STREAM, 0);
+        if (rfd < 0) { close (fd); return -1; }
+        setsockopt (rfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+        if (bind (rfd, (struct sockaddr *)&rss, rl) < 0 || listen (rfd, 16) < 0) {
+            PM_LOG_E ("tunnel-peer: reverse listen %s:%d: %s", raddr,
+                      cfg->rlisten_port, strerror (errno));
+            close (rfd); close (fd); return -1;
+        }
+        cfg->rlisten_tcp_fd = rfd;
+        PM_LOG_I ("tunnel-peer: reverse terminal listener on %s:%d", raddr, cfg->rlisten_port);
+    }
 
     /* Single-port mode (B1 peek-demux): if no separate public port is given,
        the one listener above serves BOTH the carrier and adb clients. */
@@ -1759,6 +2061,28 @@ portmux_tunnel_set_reverse_proto (Portmux *self, int proto)
     if (!cfg) return -1;
     if (proto < PM_RLP_TCP || proto > PM_RLP_BOTH) return -1;
     cfg->rlisten_proto = proto;
+    return 0;
+}
+
+/* Make the most-recently-added tunnel PEER a reverse-multihop terminal: a plain
+   local listener whose accepts emit OPENR up the chain to the edge. Returns 0. */
+int
+portmux_tunnel_peer_set_rlisten (Portmux *self,
+                                 const char *rlisten_addr, int rlisten_port,
+                                 int proto)
+{
+    if (!self || self->route_count == 0) return -1;
+    if (rlisten_port < 1 || rlisten_port > 65535) return -1;
+    if (proto != PM_RLP_TCP) return -1;        /* TCP only for v0.7.0 */
+    PortmuxRoute *r = &self->routes[self->route_count - 1];
+    if (r->proto != PORTMUX_PROTO_TUNNEL_SERVER) return -1;  /* a peer is a server */
+    PmTunnelCfg *cfg = (PmTunnelCfg *)r->egress.callback_data;
+    if (!cfg || !cfg->is_peer) return -1;
+    snprintf (cfg->rlisten_addr, sizeof cfg->rlisten_addr, "%s",
+              rlisten_addr ? rlisten_addr : "127.0.0.1");
+    cfg->rlisten_port = rlisten_port;
+    cfg->rlisten_proto = proto;
+    cfg->is_reverse_terminal = 1;
     return 0;
 }
 
