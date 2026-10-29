@@ -109,6 +109,10 @@ extern "C" {
 #define PM_MUX_DATA   0x02
 #define PM_MUX_CLOSE  0x03
 #define PM_MUX_OPENJ  0x04         /* OPEN-with-jumps: multi-hop source route  */
+#define PM_MUX_OPENR  0x05         /* reverse OPEN: travels a terminal-origin   *
+                                    * stream BACK UP the chain to the edge,     *
+                                    * which connects its reverse target (v0.7). *
+                                    * Payload = 1 byte proto, like OPEN.        */
 #define PM_MUX_HDR    3            /* 1B type + 2B stream-id (BE) */
 #define PM_MUX_MAX_STREAMS 256     /* concurrent streams per direction        */
 
@@ -129,8 +133,27 @@ extern "C" {
  * A peer that receives OPENJ with nhops>0 pops hop[0], dials it as a new
  * carrier, and forwards OPENJ with nhops-1 and the remaining list. nhops==0 is
  * the terminal case: connect final-target locally (identical to a plain OPEN).
- * OPENJ is only valid on the FORWARD origin half (reverse multi-hop is future).
- * proto applies to the FINAL target only; inter-peer hops are always TCP. */
+ * proto applies to the FINAL target only; inter-peer hops are always TCP.
+ *
+ * ── Reverse multi-hop (v0.7.0): a stream that ORIGINATES at the TERMINAL and
+ * travels BACK UP the already-established carrier chain to the EDGE, which then
+ * connects its OWN reverse target. This is how the phone (edge, behind CGNAT,
+ * dials OUT only) can be REACHED: nothing ever dials into the phone; the return
+ * path rides the carriers the edge itself built.
+ *
+ *   runner ─plain─> TERMINAL rlisten        EDGE (dialed out) ─plain─> adbd
+ *                       │  OPENR up chain        ▲  reverse target
+ *                       └───── peerB ◁── peerA ──┘  (hop-by-hop Noise)
+ *
+ * A relay hop no longer collapses to a single-stream byte pump; it runs a FULL
+ * symmetric two-carrier mux (see portmux-relaybind.h): every record crossing
+ * the hop is re-keyed from the inbound carrier's stream id to a freshly
+ * allocated outbound id (and vice-versa), so FORWARD (OPENJ) and REVERSE
+ * (OPENR) streams share the same carrier chain without id collisions. OPENR
+ * carries 1 byte proto (like OPEN); the EDGE (a tunnel-client with a reverse
+ * target set via portmux_tunnel_set_reverse_target) connects that target. The
+ * TERMINAL peer opens a plain reverse listener via
+ * portmux_tunnel_peer_set_rlisten; each accepted connection emits OPENR. */
 #define PM_MUX_MAX_HOPS   8        /* cap jump-list length (anti-loop/amplify) */
 #define PM_MUX_ADDR_MAX   128      /* max address string per hop/target        */
 
@@ -278,6 +301,20 @@ int portmux_add_tunnel_peer (Portmux *self,
                              const unsigned char psk[PM_TUNNEL_PSK_LEN],
                              PmTunnelCipher cipher,
                              const PortmuxEgress *egress);
+
+/**
+ * portmux_tunnel_peer_set_rlisten:
+ * Make the most-recently-added tunnel PEER a reverse-multihop TERMINAL: open a
+ * plain local listener on @rlisten_addr:@rlisten_port. Each connection accepted
+ * there ORIGINATES a reverse stream (PM_MUX_OPENR) that is relayed hop-by-hop
+ * BACK UP the carrier chain to the EDGE, which connects its reverse target (set
+ * with portmux_tunnel_set_reverse_target) and splices. @proto is 0=TCP (UDP/
+ * both reserved for a later revision). This is the runner-side entry for
+ * `adb connect` reaching a CGNAT'd phone edge. Returns 0 on success, -1 on err.
+ */
+int portmux_tunnel_peer_set_rlisten (Portmux *self,
+                                     const char *rlisten_addr, int rlisten_port,
+                                     int proto);
 
 /**
  * portmux_tunnel_set_jumps:

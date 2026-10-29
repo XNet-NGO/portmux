@@ -14,7 +14,7 @@
 #include "portmux-tunnel.h"
 
 #ifndef PORTMUX_VERSION
-#define PORTMUX_VERSION "dev"
+#define PORTMUX_VERSION "v0.7.0"
 #endif
 
 extern int portmux_log_level;
@@ -127,10 +127,18 @@ usage (FILE *out, const char *argv0)
         "    %s tunnel-client peerB:2222 TARGET_IP:5555 ~/.ssh/xnet-tunnel.psk\n"
         "    (jump-list = [peerB(carrier), peerC], final target TARGET_IP:5555)\n"
         "\n"
+        "reverse multi-hop (reach a CGNAT'd phone edge; phone dials OUT only):\n"
+        "  # terminal peer (runner): accept `adb connect` on :2222, route back up\n"
+        "  PM_RLISTEN=127.0.0.1:2222 %s tunnel-peer 0.0.0.0:2301 ~/.ssh/xnet-tunnel.psk\n"
+        "  # edge (phone): dial prod, jump to runner, connect local adbd on OPENR\n"
+        "  PM_RTARGET=127.0.0.1:5555 PM_JUMPS=runner:2301 \\\n"
+        "    %s tunnel-client prod:2301 127.0.0.1:5555 ~/.ssh/xnet-tunnel.psk\n"
+        "    (the phone primes the chain; `adb connect runner:2222` reaches the phone)\n"
+        "\n"
         "Run `%s --help-all` for the full reference (env vars, ciphers, PSK, exit codes).\n",
         PORTMUX_VERSION,
         argv0, argv0, argv0, argv0,
-        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
+        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 /* Expanded reference: every subcommand, all env vars, ciphers, PSK formats,
@@ -162,17 +170,26 @@ help_all (FILE *out, const char *argv0)
         "  --version, -V          print version and exit.\n"
         "\n"
         "ENVIRONMENT VARIABLES\n"
-        "  PM_RTARGET=ADDR:PORT   tunnel-server: reverse target. On a client-originated\n"
-        "                         reverse stream the server connects here (ssh -R style).\n"
+        "  PM_RTARGET=ADDR:PORT   tunnel-server: reverse target (ssh -R single hop). ALSO\n"
+        "                         the REVERSE multi-hop EDGE target on a tunnel-client\n"
+        "                         with PM_JUMPS: on an OPENR that rides the chain back,\n"
+        "                         the edge connects here (e.g. 127.0.0.1:5555 adbd). In\n"
+        "                         reverse-edge mode PM_RTARGET replaces PM_RLISTEN.\n"
         "  PM_RLISTEN=[tcp:|udp:|both:]ADDR:PORT\n"
-        "                         tunnel-client: open a local reverse listener. With a\n"
+        "                         tunnel-client: open a local reverse listener (also the\n"
+        "                         local plaintext entry for a FORWARD jump edge). With a\n"
         "                         proto prefix, bind TCP, UDP, or BOTH on that port.\n"
-        "                         Also the local plaintext entry for a jump edge.\n"
+        "                         tunnel-peer: make this peer the reverse multi-hop\n"
+        "                         TERMINAL (e.g. the runner). A connection accepted here\n"
+        "                         originates a reverse stream (OPENR) relayed back up the\n"
+        "                         chain to the edge. TCP only on a peer.\n"
         "  PM_JUMPS=ADDR:PORT[,ADDR:PORT...]\n"
         "                         tunnel-client: make this the multi-hop EDGE. The\n"
         "                         carrier dials SERVER_ADDR:PORT (= first hop); OPENJ\n"
         "                         carries the remaining hops + the TARGET positional as\n"
-        "                         the final destination. Requires PM_RLISTEN. Max %d hops.\n"
+        "                         the final destination. FORWARD needs PM_RLISTEN;\n"
+        "                         REVERSE needs PM_RTARGET (phone edge dials out, is\n"
+        "                         reached via the runner's PM_RLISTEN). Max %d hops.\n"
         "  PM_EGRESS=dev=IFNAME | src=IP\n"
         "                         tunnel-peer: pin the onward (next-hop) dial's egress.\n"
         "\n"
@@ -421,6 +438,23 @@ main (int argc, char **argv)
         int rc = portmux_add_tunnel_peer (g_pm, addr1, port1, psk, cipher, egp);
         memset (psk, 0, sizeof psk);
         if (rc < 0) { fprintf (stderr, "tunnel-peer setup failed\n"); portmux_destroy (g_pm); return 1; }
+        /* TERMINAL reverse listener (reverse multi-hop): PM_RLISTEN=addr:port on
+           a peer makes it the runner-side entry. A connection there originates a
+           reverse stream (OPENR) relayed back up the chain to the edge, which
+           connects its reverse target (PM_RTARGET on the edge tunnel-client). */
+        const char *prl = getenv ("PM_RLISTEN");
+        if (prl && *prl) {
+            if (strncmp (prl, "tcp:", 4) == 0) prl += 4;   /* only TCP for v0.7.0 */
+            char rb[256]; snprintf (rb, sizeof rb, "%s", prl);
+            char *rc2 = strrchr (rb, ':');
+            if (!rc2) { fprintf (stderr, "PM_RLISTEN needs addr:port\n"); portmux_destroy (g_pm); return 1; }
+            *rc2 = '\0';
+            if (portmux_tunnel_peer_set_rlisten (g_pm, rb, atoi (rc2 + 1), 0) < 0) {
+                fprintf (stderr, "tunnel-peer PM_RLISTEN setup failed\n"); portmux_destroy (g_pm); return 1;
+            }
+            fprintf (stderr, "reverse terminal: rlisten %s:%d (runner entry; reverse streams -> edge)\n",
+                     rb, atoi (rc2 + 1));
+        }
         signal (SIGINT, on_signal); signal (SIGTERM, on_signal);
         rc = portmux_run (g_pm);
         portmux_destroy (g_pm);
@@ -516,14 +550,21 @@ main (int argc, char **argv)
             if (rc == 0 && rl_port > 0) portmux_tunnel_set_reverse_proto (g_pm, rl_proto);
 
             /* EDGE multi-hop jump: PM_JUMPS=peerB:port,peerC:port makes this
-               client the chain entry. Its reverse listener (PM_RLISTEN) accepts
-               local plaintext clients and emits OPENJ. The jump-list is
-               [carrier(SERVER_ADDR:PORT), PM_JUMPS...] and the final target is
-               the TARGET_ADDR:TARGET_PORT positional. Requires PM_RLISTEN. */
+               client the chain entry. FORWARD edge: its reverse listener
+               (PM_RLISTEN) accepts local plaintext clients and emits OPENJ.
+               REVERSE edge: set PM_RTARGET=addr:port (e.g. the phone's adbd
+               127.0.0.1:5555) and NO PM_RLISTEN; the edge primes the carrier
+               chain and connects PM_RTARGET on reverse streams (OPENR) that the
+               terminal peer originates. The jump-list is
+               [carrier(SERVER_ADDR:PORT), PM_JUMPS...], final target is the
+               TARGET positional. Requires PM_RLISTEN (forward) OR PM_RTARGET
+               (reverse). */
             const char *jumps = getenv ("PM_JUMPS");
+            const char *ert = getenv ("PM_RTARGET");    /* edge reverse target */
             if (rc == 0 && jumps && *jumps) {
-                if (rl_port <= 0) {
-                    fprintf (stderr, "PM_JUMPS requires PM_RLISTEN=addr:port (the edge's local listener)\n");
+                int reverse_edge = (ert && strrchr (ert, ':') != NULL);
+                if (rl_port <= 0 && !reverse_edge) {
+                    fprintf (stderr, "PM_JUMPS requires PM_RLISTEN=addr:port (forward edge) or PM_RTARGET=addr:port (reverse edge)\n");
                     portmux_destroy (g_pm); return 1;
                 }
                 PmJumpEndpoint hops[PM_MUX_MAX_HOPS];
@@ -553,6 +594,17 @@ main (int argc, char **argv)
                 }
                 fprintf (stderr, "edge jump: %d hop(s) -> target %s:%d (local listener %s:%d)\n",
                          nh, addr2, port2, rl_addr ? rl_addr : "127.0.0.1", rl_port);
+                /* REVERSE edge: set the reverse target the edge connects on an
+                   OPENR that rides the chain back from the terminal. */
+                if (reverse_edge) {
+                    char rtb[256]; snprintf (rtb, sizeof rtb, "%s", ert);
+                    char *rc3 = strrchr (rtb, ':'); *rc3 = '\0';
+                    if (portmux_tunnel_set_reverse_target (g_pm, rtb, atoi (rc3 + 1)) < 0) {
+                        fprintf (stderr, "edge reverse target setup failed\n"); portmux_destroy (g_pm); return 1;
+                    }
+                    fprintf (stderr, "reverse edge: on OPENR connect %s:%d (chain primed; phone dials out)\n",
+                             rtb, atoi (rc3 + 1));
+                }
             }
         }
         /* wipe the local PSK copy from this stack frame */

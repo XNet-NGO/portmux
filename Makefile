@@ -17,7 +17,7 @@ include $(TPDIR)/noise-c/noise-c.mk
 
 # Version string for the CLI (--version). Derived from the git tag; override
 # with `make PORTMUX_VERSION=vX.Y.Z` for out-of-tree/source-tarball builds.
-PORTMUX_VERSION ?= $(shell git -C $(CURDIR) describe --tags --always --dirty 2>/dev/null || echo dev)
+PORTMUX_VERSION ?= $(shell git -C $(CURDIR) describe --tags --always --dirty 2>/dev/null || echo v0.7.0)
 
 # Internal flags are kept separate from the user-facing CFLAGS so that a
 # command-line `make CFLAGS=...` augments rather than clobbers our includes.
@@ -32,6 +32,7 @@ LIB_SRCS = $(SRCDIR)/portmux.c \
            $(SRCDIR)/portmux-egress.c \
            $(SRCDIR)/portmux-socks.c \
            $(SRCDIR)/portmux-tunnel.c \
+           $(SRCDIR)/portmux-relaybind.c \
            $(SRCDIR)/portmux-addr.c
 LIB_OBJS = $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(LIB_SRCS))
 
@@ -104,10 +105,18 @@ test: $(STATIC) $(HTS_LIB) $(CLI)
 	$(CC) $(PM_CFLAGS) $(NOISE_INC) $(NOISE_DEFS) tests/test_jumplist.c $(STATIC) -o $(BUILDDIR)/test_jumplist $(LDFLAGS)
 	@echo "RUN   test_jumplist"
 	@$(BUILDDIR)/test_jumplist
+	@echo "CC    tests/test_relaybind"
+	$(CC) $(PM_CFLAGS) $(NOISE_INC) $(NOISE_DEFS) tests/test_relaybind.c $(STATIC) -o $(BUILDDIR)/test_relaybind $(LDFLAGS)
+	@echo "RUN   test_relaybind"
+	@$(BUILDDIR)/test_relaybind
 	@echo "CC    tests/test_jump"
 	$(CC) $(PM_CFLAGS) $(NOISE_INC) $(NOISE_DEFS) tests/test_jump.c $(STATIC) -o $(BUILDDIR)/test_jump $(LDFLAGS)
 	@echo "RUN   test_jump"
 	@$(BUILDDIR)/test_jump
+	@echo "CC    tests/test_rjump"
+	$(CC) $(PM_CFLAGS) $(NOISE_INC) $(NOISE_DEFS) tests/test_rjump.c $(STATIC) -o $(BUILDDIR)/test_rjump $(LDFLAGS)
+	@echo "RUN   test_rjump"
+	@$(BUILDDIR)/test_rjump
 	@echo "CC    tests/test_cli"
 	$(CC) $(PM_CFLAGS) tests/test_cli.c -o $(BUILDDIR)/test_cli
 	@echo "RUN   test_cli (execs bin/portmux)"
